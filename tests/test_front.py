@@ -1,4 +1,4 @@
-"""Unit tests for the Photos front: routing split with Immich, owner gate, trash safety, key secrecy.
+"""Unit tests for the Photos front: routing split with Immich, owner gate, no-sign-in proxy, trash safety, secrecy.
 Run: python3 -m unittest discover -s tests"""
 import importlib.util
 import json
@@ -90,9 +90,92 @@ class Front(unittest.TestCase):
         code, ctype, body = self.m.page_route("GET", "/photos/api/import", "", {"host": "127.0.0.1:8871"}, b"")[:3]
         self.assertNotIn(b"SECRET-KEY-123", body)
 
-    def test_connect_needs_immich_session(self):
-        code, body = self.m.connect({"host": "box.ts.net:8444"})
-        self.assertEqual(code, 401)
+    def test_owner_request_gate(self):
+        o = self.m._owner_request
+        self.assertTrue(o("GET", {"host": "box.ts.net:8871", "tailscale-user-login": "owner@example.com"}))
+        self.assertTrue(o("POST", {"host": "box.ts.net:8871"}))  # the phone app: no browser headers
+        self.assertFalse(o("GET", {"host": "box.ts.net:8871", "tailscale-user-login": "guest@example.com"}))
+        self.assertFalse(o("GET", {"host": "evil.example:8871"}))  # DNS rebinding
+        self.assertFalse(o("POST", {"host": "box.ts.net:8871", "sec-fetch-site": "cross-site"}))
+        self.assertFalse(o("POST", {"host": "box.ts.net:8871", "origin": "https://evil.example"}))
+        self.assertFalse(o("GET", {"host": "box.ts.net:8871", "sec-fetch-site": "cross-site", "sec-fetch-mode": "cors"}))
+        self.assertTrue(o("GET", {"host": "box.ts.net:8871", "sec-fetch-site": "cross-site", "sec-fetch-mode": "navigate"}))
+
+    def test_session_added_only_without_own_credentials(self):
+        m = self.m
+        m.AUTH["token"] = "SESSION-TOKEN-XYZ"
+        try:
+            lines = ["GET /api/users/me HTTP/1.1", "Host: box.ts.net:8871"]
+            out = m._add_session("GET", "/api/users/me", {"host": "box.ts.net:8871"}, list(lines))
+            self.assertIn("x-immich-user-token: SESSION-TOKEN-XYZ", out)
+            own = {"host": "box.ts.net:8871", "x-immich-user-token": "phone"}
+            self.assertEqual(m._add_session("GET", "/api/users/me", own, list(lines)), lines)
+            guest = {"host": "box.ts.net:8871", "tailscale-user-login": "guest@example.com"}
+            self.assertEqual(m._add_session("GET", "/api/users/me", guest, list(lines)), lines)
+            self.assertEqual(m._add_session("GET", "/api/assets?apiKey=x", {"host": "box.ts.net:8871"}, list(lines)), lines)
+        finally:
+            m.AUTH["token"] = ""
+
+    def test_intercepts(self):
+        m = self.m
+        h = {"host": "box.ts.net:8871"}
+        self.assertIs(m._intercept("POST", "/api/auth/login", h), m.auth_route)
+        self.assertIs(m._intercept("POST", "/api/auth/logout", h), m.auth_route)
+        self.assertIs(m._intercept("GET", "/api/server/features", h), m.phone_config_route)
+        self.assertIsNone(m._intercept("GET", "/api/server/features", dict(h, **{"sec-fetch-site": "same-origin"})))
+        self.assertIsNone(m._intercept("POST", "/api/auth/login", {"host": "box.ts.net:8871", "tailscale-user-login": "guest@example.com"}))
+        self.assertIsNone(m._intercept("GET", "/api/assets", h))
+        nav = dict(h, **{"sec-fetch-dest": "document", "accept": "text/html"})
+        self.assertIsNone(m._intercept("GET", "/photos", nav))  # not set up yet: no cookie promised
+        m.AUTH["token"] = "t"
+        try:
+            self.assertIs(m._intercept("GET", "/photos", nav), m.page_with_cookie_route)
+            self.assertIsNone(m._intercept("GET", "/photos", dict(nav, cookie="immich_is_authenticated=true")))
+        finally:
+            m.AUTH["token"] = ""
+
+    def test_phone_continue_flow_checks_pkce_and_is_single_use(self):
+        m = self.m
+        old = m._login_upstream
+        m._login_upstream = lambda ua="": (201, {"accessToken": "PHONE-SESSION", "userId": "u", "isAdmin": True})
+        try:
+            h = {"host": "box.ts.net:8871", "content-type": "application/json"}
+            verifier = "v" * 50
+            body = json.dumps({"redirectUri": "app.immich:///oauth-callback", "state": "S1",
+                               "codeChallenge": m._b64url_sha256(verifier)}).encode()
+            code, _, out = m.auth_route("POST", "/api/oauth/authorize", "", h, body)[:3]
+            self.assertEqual(code, 201)
+            url = json.loads(out)["url"]
+            self.assertTrue(url.startswith("https://box.ts.net:8871/wizard-sign-in?r="))
+            r = m.auth_route("GET", "/wizard-sign-in", url.split("?", 1)[1], h, b"")
+            self.assertEqual(r[0], 302)
+            loc = r[3]["Location"]
+            self.assertTrue(loc.startswith("app.immich:///oauth-callback?code="))
+            bad = json.dumps({"url": loc, "state": "S1", "codeVerifier": "wrong"}).encode()
+            self.assertEqual(m.auth_route("POST", "/api/oauth/callback", "", h, bad)[0], 401)
+            # a failed check burns the code; a fresh round succeeds once
+            code, _, out = m.auth_route("POST", "/api/oauth/authorize", "", h, body)[:3]
+            r = m.auth_route("GET", "/wizard-sign-in", json.loads(out)["url"].split("?", 1)[1], h, b"")
+            good = json.dumps({"url": r[3]["Location"], "state": "S1", "codeVerifier": verifier}).encode()
+            code, _, out = m.auth_route("POST", "/api/oauth/callback", "", h, good)[:3]
+            self.assertEqual((code, json.loads(out)["accessToken"]), (201, "PHONE-SESSION"))
+            self.assertEqual(m.auth_route("POST", "/api/oauth/callback", "", h, good)[0], 401)
+            evil = json.dumps({"redirectUri": "https://evil.example/cb"}).encode()
+            self.assertEqual(m.auth_route("POST", "/api/oauth/authorize", "", h, evil)[0], 400)
+            code, _, out = m.auth_route("POST", "/api/auth/login", "", h, b'{"email":"","password":""}')[:3]
+            self.assertEqual(code, 201)
+            self.assertEqual(json.loads(m.auth_route("POST", "/api/auth/logout", "", h, b"")[2])["successful"], True)
+        finally:
+            m._login_upstream = old
+
+    def test_owner_password_never_in_status(self):
+        self.m._write_json("owner.json", {"email": "owner@photos.wizard", "password": "PW-SECRET-987", "token": "TOK-555"})
+        out = json.dumps(self.m.status())
+        self.assertNotIn("PW-SECRET-987", out)
+        self.assertNotIn("TOK-555", out)
+        self.assertTrue(json.loads(out)["sign_in"]["managed_account"])
+        st = os.stat(os.path.join(self.m.STATE, "owner.json"))
+        self.assertEqual(st.st_mode & 0o777, 0o600)
 
     def test_page_served_with_csp(self):
         out = self.m.page_route("GET", "/photos/", "", {"host": "box.ts.net:8444"}, b"")

@@ -2,15 +2,21 @@
 
 - The Wizard page lives at /photos/ (and its files under /photos/). Immich's own web app keeps every other path,
   including /photos (its timeline) and /photos/<asset-uuid> (its viewer), so the app's own port is plain Immich.
-- The agent's tools at /mcp talk to Immich's documented REST API (https://api.immich.app) with an API key that the
-  owner creates with one tap on the Wizard page while signed in to Immich. The key never leaves this box's
-  private state volume and is never returned by any route.
+- No sign-in: reaching this box over Tailscale is the only access control. On first start this front creates Immich's
+  one account itself (a placeholder email and a random password kept only in the private state volume, never shown),
+  and every request it passes to Immich without its own credentials gets that account's session added. The Immich
+  phone app's sign-in (password or the "Continue" button) is answered here with a real session for the same account.
+- The agent's tools at /mcp talk to Immich's documented REST API (https://api.immich.app) with a narrow API key this
+  front makes for itself on first start. Secrets never leave the private state volume and no route returns them.
 - Google Takeout import uses immich-go (https://github.com/simulot/immich-go, AGPL-3.0), downloaded on the
   owner's first import and checked against its pinned release checksum.
 """
 import hashlib
+import hmac
+import http.client as httpclient  # bound as httpclient only: the front's own http() helper keeps its name
 import io
 import re
+import secrets
 import subprocess
 import tarfile
 import threading
@@ -73,11 +79,13 @@ def _write_json(name, data):
 
 # ---------------- Immich API ----------------
 
-def _immich(method, path, payload=None, key=None, cookie=None, timeout=30, raw=False):
+def _immich(method, path, payload=None, key=None, cookie=None, timeout=30, raw=False, token=None, extra=None):
     """Call Immich's REST API. Returns (status, parsed JSON or bytes). Never raises for HTTP errors."""
-    headers = {"Accept": "application/json"}
+    headers = dict(extra or {}, Accept="application/json")
     if key:
         headers["x-api-key"] = key
+    if token:
+        headers["x-immich-user-token"] = token
     if cookie:
         headers["Cookie"] = cookie
     data = None
@@ -105,12 +113,14 @@ def _key():
 def _api(method, path, payload=None, timeout=60):
     key = _key()
     if not key:
-        raise RuntimeError("The agent is not connected to Photos yet. Ask the owner to open Photos in Wizard, sign in "
-                           "to Immich and tap 'Let my agent help' (photos_status shows the exact step).")
+        raise RuntimeError("Photos is still setting itself up (Immich starting, or the agent key not made yet). "
+                           "Try again in a minute; photos_status shows progress.")
     code, body = _immich(method, path, payload, key=key, timeout=timeout)
+    if code == 401 and _ensure_agent_key(force=True):
+        code, body = _immich(method, path, payload, key=_key(), timeout=timeout)
     if code == 401:
-        raise RuntimeError("Immich no longer accepts the agent's key (it was deleted in Immich). Ask the owner to tap "
-                           "'Let my agent help' again on the Photos page.")
+        raise RuntimeError("Immich does not accept the agent's key and Photos could not make a new one yet. "
+                           "Try again shortly; photos_status shows progress.")
     if code == 0:
         raise RuntimeError(body.get("error"))
     if code >= 400:
@@ -153,6 +163,10 @@ def status(headers=None):
         _, cfg = _immich("GET", "/server/config", timeout=5)
         out["immich"]["has_owner_account"] = bool(cfg.get("isInitialized"))
         out["immich"]["trash_days"] = cfg.get("trashDays")
+    owner = _owner()
+    out["sign_in"] = {"mode": "none: anyone who reaches this box over Tailscale (the owner's tailnet) is the owner",
+                      "managed_account": bool(owner.get("password")), "ready": bool(AUTH.get("token")),
+                      **({"problem": AUTH["error"]} if AUTH.get("error") else {})}
     key = _key()
     if key and out["immich"]["reachable"]:
         c, me = _immich("GET", "/users/me", key=key, timeout=10)
@@ -177,11 +191,9 @@ def status(headers=None):
     out["links"] = {"wizard": "?open=photos", **({"immich": own + "/", "mobile_server_url": own} if own else {})}
     if not out["immich"]["reachable"]:
         out["next"] = "Immich is starting (the first start takes a minute or two). Try again shortly."
-    elif not out["immich"]["has_owner_account"]:
-        out["next"] = ("The owner opens Photos in Wizard and creates his Immich admin account (Getting started): his "
-                       "email, a name and a password he chooses. Nobody else can do this step.")
-    elif not out["agent_connected"]:
-        out["next"] = "The owner taps 'Let my agent help' on the Photos page (while signed in to Immich)."
+    elif not out["immich"]["has_owner_account"] or not out["agent_connected"]:
+        out["next"] = ("Photos is setting itself up (it makes its own account; no sign-in for the owner). Check again "
+                       "in a minute." if not AUTH.get("error") else "Setup problem: " + AUTH["error"])
     return out
 
 
@@ -405,8 +417,13 @@ def _log_tail(path, n=12):
             lines = f.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return []
-    key = _key()
-    return [(l.replace(key, "***") if key else l)[:300] for l in lines[-n:]]
+    hide = [x for x in (_key(), _owner().get("password"), _owner().get("token"), AUTH.get("token")) if x]
+    out = []
+    for l in lines[-n:]:
+        for x in hide:
+            l = l.replace(x, "***")
+        out.append(l[:300])
+    return out
 
 
 def import_summary():
@@ -504,7 +521,7 @@ def import_start(confirmed=False):
         if not files:
             return {"started": False, "message": "No Takeout files yet. Put the .zip parts in Files > Photos > Import."}
         if not _key():
-            raise RuntimeError("Connect the agent first: the owner taps 'Let my agent help' on the Photos page.")
+            raise RuntimeError("Photos is still setting itself up (no agent key yet). Try again in a minute.")
         if not confirmed:
             return {"started": False, "preview": True, "files": files,
                     "next": "Call again with confirmed=true to import these %d file(s) into Immich." % len(files)}
@@ -533,50 +550,317 @@ def _prepare_import_dir():
 STARTUP.append(_prepare_import_dir)
 
 
-# ---------------- agent connection (owner's Immich session, one tap) ----------------
+# ---------------- no sign-in: Photos' own Immich account, added to every request ----------------
+# Miguel: "Tailscale will be my one and only access. I don't want to have to log into something. I'm the only user."
+# Immich keeps its normal accounts; this front owns the single account and answers for it:
+# - first start: admin sign-up with a placeholder email and a random password (owner.json, 0600, never shown),
+#   then one login session for browsers and a narrow API key for the agent;
+# - every request passed to Immich that brings no credentials of its own gets that session (x-immich-user-token),
+#   and browser page loads get Immich's readable "immich_is_authenticated" cookie, so the web app opens signed in;
+# - the phone app's sign-in (POST /api/auth/login with anything, or its OAuth "Continue" button, answered here with
+#   PKCE checked) returns a real Immich session for that account, so the phone has its own device session.
+# Requests from another tailnet login than the owner's, from a host name this box doesn't serve, or cross-site from
+# a web page (writes) get nothing added and meet Immich's normal sign-in.
 
-def _session_cookie(headers):
-    jar = {}
-    for part in (headers.get("cookie") or "").split(";"):
-        k, _, v = part.strip().partition("=")
-        if k:
-            jar[k] = v
-    keep = {k: jar[k] for k in ("immich_access_token", "immich_auth_type", "immich_is_authenticated") if k in jar}
-    return "; ".join("%s=%s" % kv for kv in keep.items()) if "immich_access_token" in keep else ""
-
-
-def connect(headers):
-    cookie = _session_cookie(headers)
-    if not cookie:
-        return 401, {"error": "Sign in to Photos (Immich) first, then tap again.", "code": "signin_needed"}
-    c, me = _immich("GET", "/users/me", cookie=cookie)
-    if c != 200:
-        return 401, {"error": "Your Immich sign-in has expired. Sign in again, then tap again.", "code": "signin_needed"}
-    if not me.get("isAdmin"):
-        return 403, {"error": "Only the Photos owner (Immich admin) can connect the agent.", "code": "owner_only"}
-    old = _read_json("agent-key.json") or {}
-    if old.get("id"):
-        _immich("DELETE", "/api-keys/%s" % old["id"], cookie=cookie)
-    c, made = _immich("POST", "/api-keys", {"name": KEY_NAME, "permissions": KEY_PERMISSIONS}, cookie=cookie)
-    if c not in (200, 201) or not made.get("secret"):
-        return 502, {"error": "Immich did not create the key (%s)." % c}
-    _write_json("agent-key.json", {"id": (made.get("apiKey") or {}).get("id"), "secret": made["secret"],
-                                    "user": me.get("email"), "created_at": int(time.time())})
-    return 200, {"connected": True, "account": me.get("email")}
+OWNER_EMAIL = "owner@photos.wizard"  # a placeholder, never a person's address; Immich only needs some email
+OWNER_NAME = "Owner"
+AUTH = {"token": "", "error": ""}
+AUTH_LOCK = threading.Lock()
+KEY_LOCK = threading.Lock()
+PENDING = {}  # phone sign-in starts: nonce -> {"redirect", "state", "challenge", "exp"}
+CODES = {}  # one-time phone sign-in codes: code -> {"state", "challenge", "exp"}
+CODE_TTL = 300
+OWN_CREDENTIALS = ("x-immich-user-token", "x-immich-session-token", "authorization", "x-api-key")
+SIGN_IN_PATH = "/wizard-sign-in"
+COOKIE_AGE = 400 * 86400
 
 
-def disconnect(headers):
-    old = _read_json("agent-key.json") or {}
-    cookie = _session_cookie(headers)
-    revoked = False
-    if old.get("id") and cookie:
-        c, _ = _immich("DELETE", "/api-keys/%s" % old["id"], cookie=cookie)
-        revoked = c in (200, 204)
+def _owner():
+    return _read_json("owner.json", {}) or {}
+
+
+def _login_upstream(user_agent=""):
+    """A real Immich password login for Photos' own account: (status, Immich's LoginResponseDto)."""
+    o = _owner()
+    if not o.get("password"):
+        return 503, {"message": "Photos is still setting itself up. Try again in a minute.", "statusCode": 503}
+    return _immich("POST", "/auth/login", {"email": o["email"], "password": o["password"]},
+                   extra={"User-Agent": user_agent or "Wizard Photos"}, timeout=30)
+
+
+def _ensure_agent_key(force=False):
+    with KEY_LOCK:
+        old = _read_json("agent-key.json") or {}
+        if old.get("secret") and not force:
+            c, _ = _immich("GET", "/users/me", key=old["secret"], timeout=10)
+            if c != 401:
+                return c == 200
+        tok = AUTH.get("token")
+        if not tok:
+            return False
+        if old.get("id"):
+            _immich("DELETE", "/api-keys/%s" % old["id"], token=tok)
+        c, made = _immich("POST", "/api-keys", {"name": KEY_NAME, "permissions": KEY_PERMISSIONS}, token=tok)
+        if c not in (200, 201) or not made.get("secret"):
+            return False
+        _write_json("agent-key.json", {"id": (made.get("apiKey") or {}).get("id"), "secret": made["secret"],
+                                        "user": _owner().get("email"), "created_at": int(time.time())})
+        return True
+
+
+def _setup_once():
+    """Make sure Photos' own account, its session and the agent key exist. True when everything is ready."""
+    with AUTH_LOCK:
+        code, _ = _immich("GET", "/server/ping", timeout=5)
+        if code != 200:
+            return False
+        _, cfg = _immich("GET", "/server/config", timeout=10)
+        o = _owner()
+        if not cfg.get("isInitialized"):
+            if not o.get("password"):
+                o = {"email": OWNER_EMAIL, "password": secrets.token_urlsafe(32), "created_at": int(time.time())}
+                _write_json("owner.json", o)  # saved before Immich hears it, so a crash never strands the account
+            c, b = _immich("POST", "/auth/admin-sign-up",
+                           {"email": o["email"], "password": o["password"], "name": OWNER_NAME}, timeout=30)
+            if c not in (200, 201):
+                AUTH["error"] = "Immich did not create Photos' account (%s: %s)" % (c, (b or {}).get("message"))
+                return False
+        elif not o.get("password"):
+            AUTH["error"] = ("Immich already has an account that Photos did not make, so Photos cannot open it without "
+                             "a sign-in. Reinstalling Photos with its data removed starts fresh.")
+            return False
+        tok = AUTH.get("token") or o.get("token") or ""
+        me = {}
+        if tok:
+            c, me = _immich("GET", "/users/me", token=tok, timeout=10)
+            if c == 401:
+                tok = ""
+        if not tok:
+            c, b = _login_upstream()
+            if c not in (200, 201) or not (b or {}).get("accessToken"):
+                AUTH["error"] = "Photos could not open its own Immich account (%s)." % c
+                return False
+            tok = b["accessToken"]
+            o["token"] = tok
+            _write_json("owner.json", o)
+            c, me = _immich("GET", "/users/me", token=tok, timeout=10)
+        AUTH["token"] = tok
+        if isinstance(me, dict) and me.get("shouldChangePassword") and me.get("id"):
+            # Immich asks a new admin to change his password on the first phone sign-in; there is no password to change.
+            _immich("PUT", "/admin/users/%s" % me["id"], {"shouldChangePassword": False}, token=tok)
+        if not o.get("onboarded"):
+            # Skip Immich's first-run tour for the one account; its settings stay in Immich > Administration.
+            c1, _ = _immich("POST", "/system-metadata/admin-onboarding", {"isOnboarded": True}, token=tok)
+            c2, _ = _immich("PUT", "/users/me/onboarding", {"isOnboarded": True}, token=tok)
+            if c1 in (200, 201, 204) and c2 in (200, 201, 204):
+                o["onboarded"] = True
+                _write_json("owner.json", o)
+        ok = _ensure_agent_key()
+        AUTH["error"] = "" if ok else "Photos could not make the agent's key yet."
+        return ok
+
+
+def _auth_loop():
+    while True:
+        try:
+            ok = _setup_once()
+        except Exception as e:  # keep retrying; the status shows the problem
+            ok, AUTH["error"] = False, "%s: %s" % (type(e).__name__, e)
+        time.sleep(300 if ok else 10)
+
+
+STARTUP.append(lambda: threading.Thread(target=_auth_loop, daemon=True).start())
+
+
+def _hostname(netloc):
+    netloc = (netloc or "").strip().lower()
+    if netloc.startswith("["):
+        return netloc.split("]")[0] + "]"
+    return netloc.rsplit(":", 1)[0] if netloc.count(":") == 1 else netloc
+
+
+def _served_names():
+    names = {_hostname(h) for h in (os.environ.get("WIZARD_TRUSTED_HOSTS") or "").split(",") if h.strip()}
+    return names | {"127.0.0.1", "localhost"} if names else set()
+
+
+def _owner_request(method, headers):
+    """Is this request the box owner's own (his tailnet, this box's address, not a cross-site write)?"""
+    names = _served_names()
+    if names and _hostname(headers.get("host")) not in names:
+        return False
+    login = (headers.get("tailscale-user-login") or "").strip().lower()
+    owners = {x.strip().lower() for x in (os.environ.get("WIZARD_OWNER_LOGINS") or "").split(",") if x.strip()}
+    if owners and login and login not in owners:
+        return False
+    read = method in ("GET", "HEAD")
+    if headers.get("sec-fetch-site") == "cross-site" and not (read and headers.get("sec-fetch-mode") == "navigate"):
+        return False
+    origin = headers.get("origin")
+    if origin and not read:
+        oname = urllib.parse.urlsplit(origin).hostname if origin != "null" else None
+        if not oname or (names and oname not in names) or (not names and oname != _hostname(headers.get("host"))):
+            return False
+    return True
+
+
+def _has_own_credentials(target, headers):
+    if any(headers.get(h) for h in OWN_CREDENTIALS) or "immich_access_token=" in (headers.get("cookie") or ""):
+        return True
+    q = target.partition("?")[2]
+    return bool(q) and any(k in ("apiKey", "sessionKey") for k, _ in urllib.parse.parse_qsl(q))
+
+
+def _add_session(method, target, headers, lines):
+    tok = AUTH.get("token")
+    if not tok or _has_own_credentials(target, headers) or not _owner_request(method, headers):
+        return lines
+    return lines[:1] + [l for l in lines[1:] if not l.lower().startswith("x-immich-user-token:")] + [
+        "x-immich-user-token: " + tok]
+
+
+HEAD_REWRITE.append(_add_session)
+
+
+def _base_url(headers):
+    host = (headers.get("host") or "").strip()
+    proto = (headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    if proto not in ("http", "https"):
+        proto = "https" if _hostname(host).endswith(".ts.net") else "http"
+    return "%s://%s" % (proto, host)
+
+
+def _b64url_sha256(text):
+    return base64.urlsafe_b64encode(hashlib.sha256(text.encode()).digest()).decode().rstrip("=")
+
+
+def _expire():
+    now = time.time()
+    for d in (PENDING, CODES):
+        for k in [k for k, v in d.items() if v["exp"] < now]:
+            d.pop(k, None)
+
+
+def _sign_in_page(code, text):
+    html = ("<!doctype html><meta name=viewport content='width=device-width'><title>Photos</title>"
+            "<body style='font:1rem system-ui;padding:1.5rem'><p>%s</p>" % text)
+    return code, "text/html; charset=utf-8", html.encode()
+
+
+def _login_answer(headers):
+    c, b = _login_upstream(headers.get("user-agent", ""))
+    if c in (200, 201) and (b or {}).get("accessToken"):
+        return _json(201, b)
+    return _json(503 if c in (0, 503) else 502, {"message": "Photos could not open its account right now. Try again "
+                                                            "in a minute.", "statusCode": 503})
+
+
+def auth_route(method, path, query, headers, body):
+    """Immich's sign-in endpoints, answered for Photos' own account (see the section comment)."""
+    _expire()
+    if path == "/api/auth/login":
+        return _login_answer(headers)
+    if path == "/api/auth/logout":
+        # Nothing to sign out of: the session stays, the web app goes back to the library.
+        return _json(200, {"successful": True, "redirectUri": "/photos"})
+    if path == "/api/oauth/authorize":
+        d = json.loads(body or b"{}") if body else {}
+        redirect = str(d.get("redirectUri") or "")
+        rp = urllib.parse.urlsplit(redirect)
+        if not (rp.scheme == "app.immich" or (rp.scheme in ("http", "https") and
+                                              _hostname(rp.netloc) == _hostname(headers.get("host")))):
+            return _json(400, {"message": "unsupported redirect", "statusCode": 400})
+        if len(PENDING) > 200:
+            return _json(429, {"message": "too many sign-ins in progress", "statusCode": 429})
+        nonce = secrets.token_urlsafe(24)
+        PENDING[nonce] = {"redirect": redirect, "state": str(d.get("state") or ""),
+                          "challenge": str(d.get("codeChallenge") or ""), "exp": time.time() + CODE_TTL}
+        return _json(201, {"url": _base_url(headers) + SIGN_IN_PATH + "?" + urllib.parse.urlencode({"r": nonce})})
+    if path == SIGN_IN_PATH:
+        nonce = dict(urllib.parse.parse_qsl(query)).get("r", "")
+        p = PENDING.pop(nonce, None)
+        if not p:
+            return _sign_in_page(400, "This link has expired. Go back to the Immich app and tap Continue again.")
+        code = secrets.token_urlsafe(32)
+        CODES[code] = {"state": p["state"], "challenge": p["challenge"], "exp": time.time() + CODE_TTL}
+        sep = "&" if "?" in p["redirect"] else "?"
+        loc = p["redirect"] + sep + urllib.parse.urlencode({"code": code, "state": p["state"]})
+        return 302, "text/html; charset=utf-8", b"", {"Location": loc}
+    if path == "/api/oauth/callback":
+        d = json.loads(body or b"{}") if body else {}
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(str(d.get("url") or "")).query))
+        entry = CODES.pop(q.get("code", ""), None)
+        if not entry:
+            return _json(401, {"message": "This sign-in has expired. Tap Continue again.", "statusCode": 401})
+        state = str(d.get("state") or q.get("state") or "")
+        if entry["state"] and not hmac.compare_digest(entry["state"], state):
+            return _json(401, {"message": "Sign-in state did not match. Tap Continue again.", "statusCode": 401})
+        if entry["challenge"] and not hmac.compare_digest(entry["challenge"], _b64url_sha256(str(d.get("codeVerifier") or ""))):
+            return _json(401, {"message": "Sign-in check failed. Tap Continue again.", "statusCode": 401})
+        return _login_answer(headers)
+    return _json(404, {"message": "not found", "statusCode": 404})
+
+
+def phone_config_route(method, path, query, headers, body):
+    """Immich's public features/config for the phone app: one "Continue" button instead of an email/password form."""
+    c, b = _immich("GET", path[len("/api"):] + ("?" + query if query else ""), timeout=15)
+    if c == 200 and isinstance(b, dict):
+        if path.endswith("/features"):
+            b.update(oauth=True, oauthAutoLaunch=False, passwordLogin=False)
+        else:
+            b["oauthButtonText"] = "Continue"
+    return _json(c or 502, b)
+
+
+HOP = {"connection", "keep-alive", "transfer-encoding", "content-length", "content-type", "cache-control",
+       "x-content-type-options", "set-cookie", "upgrade", "proxy-connection", "te", "trailer"}
+
+
+def page_with_cookie_route(method, path, query, headers, body):
+    """A browser page load: Immich's own answer plus its readable sign-in marker cookie."""
+    target = path + ("?" + query if query else "")
+    fwd = {k: headers[k] for k in ("accept", "accept-language", "user-agent") if headers.get(k)}
+    fwd["x-immich-user-token"] = AUTH.get("token", "")
+    conn = httpclient.HTTPConnection(up_addr(), UP_PORT, timeout=30)
     try:
-        os.remove(_state_path("agent-key.json"))
-    except OSError:
-        pass
-    return 200, {"connected": False, "key_revoked_in_immich": revoked}
+        conn.request(method, target, headers=fwd)
+        r = conn.getresponse()
+        data = r.read()
+        extra = {k: v for k, v in r.getheaders() if k.lower() not in HOP}
+        ctype = r.getheader("content-type") or "text/html; charset=utf-8"
+        code = r.status
+    finally:
+        conn.close()
+    secure = "; Secure" if _base_url(headers).startswith("https:") else ""
+    extra["Set-Cookie"] = "immich_is_authenticated=true; Path=/; Max-Age=%d; SameSite=Lax%s" % (COOKIE_AGE, secure)
+    return code, ctype, data, extra
+
+
+AUTH_PATHS = {"/api/auth/login", "/api/auth/logout", "/api/oauth/authorize", "/api/oauth/callback"}
+
+
+def _intercept(method, target, headers):
+    path = target.split("?", 1)[0]
+    if not (path in AUTH_PATHS or path == SIGN_IN_PATH or path.startswith("/api/server/") or
+            not path.startswith(("/api/", "/.well-known/"))):
+        return None
+    if not _owner_request(method, headers):
+        return None
+    if path in AUTH_PATHS and method == "POST":
+        return auth_route
+    if path == SIGN_IN_PATH and method in ("GET", "HEAD"):
+        return auth_route
+    if method == "GET" and path in ("/api/server/features", "/api/server/config") and not headers.get("sec-fetch-site"):
+        return phone_config_route  # the phone app (browsers always send Sec-Fetch-Site)
+    if (method in ("GET", "HEAD") and AUTH.get("token") and not path.startswith(("/api/", "/.well-known/"))
+            and "immich_is_authenticated=" not in (headers.get("cookie") or "")
+            and not _has_own_credentials(target, headers)
+            and (headers.get("sec-fetch-dest") in ("document", "iframe") or "text/html" in (headers.get("accept") or ""))):
+        return page_with_cookie_route
+    return None
+
+
+INTERCEPTS.append(_intercept)
 
 
 # ---------------- MCP tools (box-only: the agent through the Wizard hub) ----------------
@@ -802,12 +1086,6 @@ def page_route(method, path, query, headers, body):
             if method == "POST" and sub == "api/import/start":
                 _body(headers, body)
                 return _json(200, import_start(True))
-            if method == "POST" and sub == "api/connect":
-                _body(headers, body)
-                return _json(*connect(headers))
-            if method == "POST" and sub == "api/disconnect":
-                _body(headers, body)
-                return _json(*disconnect(headers))
         except (ValueError, RuntimeError) as e:
             return _json(400, {"error": str(e)})
         return _json(404, {"error": "not found"})

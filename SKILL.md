@@ -1,7 +1,7 @@
 ---
 name: photos
 description: "Use when the owner asks about his photos, Google Photos, Takeout import, faces/people, or deleting photos."
-version: 0.1.0
+version: 0.2.0
 author: Oscar Henry Collins, Hermes Agent
 license: AGPL-3.0-only
 metadata:
@@ -14,7 +14,7 @@ metadata:
 The owner's own Google Photos replacement: unmodified Immich on his box, opened in Wizard at `?open=photos`. Tools come through the single Wizard MCP gateway as `photos_*`.
 
 ## Tools
-- `photos_status`: start here. Immich up?, owner account made?, agent connected?, photo/video counts, background work (face detection/grouping, search indexing), import state, free disk, links (`links.mobile_server_url` is what the Immich phone app needs), and `next` = the owner's next step. Read `next` back to him in plain words.
+- `photos_status`: start here. Immich up?, Photos' own account made (`immich.has_owner_account`, `sign_in.ready`)?, agent connected?, photo/video counts, background work (face detection/grouping, search indexing), import state, free disk, links (`links.mobile_server_url` is what the Immich phone app needs), and `next` = the owner's next step. Read `next` back to him in plain words.
 - `photos_people`: face groups by name with photo counts (`include_unnamed` for unnamed groups). Faces appear only after the background work finishes; a big import takes hours to a day on CPU.
 - `photos_search`: `query` = meaning search ("dog on the beach"); without it, filters (`person` name or id, `taken_after`/`taken_before` YYYY-MM-DD, `media_type`, `city`, `favorite`) with an exact `total_matching`.
 - `photos_move_to_trash`: by `asset_ids` or by `person` and/or dates. Always twice: first call (no `confirmed`) returns the count and a sample. Tell the owner the exact number, get his explicit yes, then call with `confirmed=true, expected_count=<that number>`. Moves to Immich's trash (30 days by default); never permanent. It refuses an empty filter.
@@ -23,10 +23,12 @@ The owner's own Google Photos replacement: unmodified Immich on his box, opened 
 
 Permanent deletion is the owner's own act in Immich: Trash › Empty trash (or wait 30 days). Never claim a photo is gone for good after `photos_move_to_trash`.
 
-## First open (owner only; never do this for him)
-1. Open Photos in Wizard. Immich shows **Getting started**: he enters his email, name and a password he chooses (he is the admin). Never type or suggest passwords.
-2. Tap **Agent › Let my agent help** (while signed in). That makes a narrow Immich API key kept on the box; until then every tool except `photos_status` answers "not connected".
-3. Phone backup: install **Immich** from Google Play/F-Droid/App Store, server URL = `links.mobile_server_url` (his Tailscale address with port 8871; Tailscale must be on), sign in, Backup › choose albums (Camera) › turn on backup. Optional: Settings › Background backup.
+## No sign-in (Tailscale is the lock)
+The owner never makes an account or types a password; never ask him for one or offer to "set up a login". On first start Photos creates Immich's one account itself (placeholder email `owner@photos.wizard`, random password kept only in the app's private state volume as `owner.json`; never read, print or share it), marks Immich's first-run tour done, and connects the agent with a narrow API key. Every visit from his tailnet arrives signed in: the Wizard screen (`?open=photos`), Immich full screen (`links.immich`) and the phone app. A different tailnet user than the owner, or a cross-site write from a web page, meets Immich's normal sign-in instead.
+
+- Not ready yet (`sign_in.ready` false, `next` says setting up): Immich is still starting; check again in a minute. `sign_in.problem` names a real setup failure; report it as is.
+- Phone backup: install **Immich** (Google Play / F-Droid / App Store), Tailscale on, server URL = `links.mobile_server_url` (his Tailscale address with port 8871) › **Next** › **Continue** (one button, no email/password form). Then Backup › choose albums (Camera) › turn on backup; optional Settings › Background backup. If an older app still shows email/password, any text works (e.g. `me@photos` / `x`).
+- "Sign out" in Immich just returns to the library. Account settings › Devices lists the sessions; removing the phone's session makes the app show **Continue** again.
 
 ## Google Takeout (Photos only)
 1. On a computer: takeout.google.com › **Deselect all** › tick only **Google Photos** (All photo albums included) › Next step.
@@ -40,10 +42,10 @@ immich-go v0.32.0 (AGPL-3.0, github.com/simulot/immich-go) is downloaded on the 
 
 ## Where things are
 - Originals and thumbnails: `~/runtipi/media/Photos/Library` (Immich-managed; don't rename or edit files there). Takeout drop folder: `~/runtipi/media/Photos/Import`.
-- Database, its random password, the agent key and ML models: the app's Docker volumes `photos_wizardapps_photos-db`, `…_photos-secrets`, `…_photos-state`, `…_photos-model-cache` (kept across app updates; an uninstall that removes volumes deletes the database, not the photo files).
-- Immich full screen: the app's own port (`links.immich`). The Wizard page at `/photos/` frames it and adds Import and Agent.
+- Database, its random password, Photos' own account (`owner.json`), the agent key and ML models: the app's Docker volumes `photos_wizardapps_photos-db`, `…_photos-secrets`, `…_photos-state`, `…_photos-model-cache` (kept across app updates; an uninstall that removes volumes deletes the database, not the photo files).
+- Immich full screen: the app's own port (`links.immich`). The Wizard page at `/photos/` frames it and adds Import and Agent (phone steps and what the agent may do).
 
 ## Failure notes
-- "not connected" or 401: the key was deleted in Immich; owner taps Agent › Let my agent help again.
+- "still setting itself up" or 401: Photos remakes the agent's key by itself (on the next call or within 5 minutes); just retry. Never ask the owner to sign in.
 - Import `failed`: read `log_tail`; common causes are a missing zip part or a full disk (`photos_status.disk`). Re-run after fixing.
 - Immich not reachable for >5 min after install: check `docker ps --filter name=photos` health and `docker logs photos_wizardapps-photos-server-1`.

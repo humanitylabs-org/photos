@@ -1,0 +1,27 @@
+{
+  "name": "Photos",
+  "id": "photos",
+  "wizard_type": "view",
+  "available": true,
+  "short_desc": "Your own Google Photos: Immich on your Wizard, with face groups, search, Takeout import and phone backup.",
+  "author": "Immich (immich.app); packaged by Oscar Henry Collins",
+  "port": 8871,
+  "categories": [
+    "media"
+  ],
+  "description": "Unmodified Immich, the open-source Google Photos replacement, on your own box. Import your whole Google Photos library from Google Takeout (dates, places, descriptions and albums come across), let Immich group faces and index what is in each photo, then clean up: find photos by person, date, place or meaning, and move the ones you don't want to the trash. Back up your Android or iPhone with the official Immich app. Photos live in Files > Photos > Library; drop Takeout .zip files in Files > Photos > Import. Your agent can count, find, import and move to trash (never a permanent delete) once you allow it with one tap. Face recognition and search run on this box's CPU. Needs about 4 GB of RAM and disk for your whole library.",
+  "tipi_version": 1,
+  "version": "0.1.0",
+  "source": "https://github.com/oscarhenrycollins/photos",
+  "website": "https://immich.app",
+  "exposable": true,
+  "supported_architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "created_at": 1794789382991,
+  "updated_at": 1794789382991,
+  "dynamic_config": true,
+  "min_tipi_version": "4.8.0",
+  "form_fields": []
+}

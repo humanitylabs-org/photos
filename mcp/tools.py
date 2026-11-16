@@ -1,0 +1,822 @@
+"""Photos: Wizard's front for Immich (https://immich.app, AGPL-3.0), run unmodified next to this front.
+
+- The Wizard page lives at /photos/ (and its files under /photos/). Immich's own web app keeps every other path,
+  including /photos (its timeline) and /photos/<asset-uuid> (its viewer), so the app's own port is plain Immich.
+- The agent's tools at /mcp talk to Immich's documented REST API (https://api.immich.app) with an API key that the
+  owner creates with one tap on the Wizard page while signed in to Immich. The key never leaves this box's
+  private state volume and is never returned by any route.
+- Google Takeout import uses immich-go (https://github.com/simulot/immich-go, AGPL-3.0), downloaded on the
+  owner's first import and checked against its pinned release checksum.
+"""
+import hashlib
+import io
+import re
+import subprocess
+import tarfile
+import threading
+import urllib.error
+
+STATE = os.environ.get("STATE_DIR") or os.environ.get("DATA_DIR") or "/state"
+IMPORT_DIR = os.environ.get("IMPORT_DIR", "/import")
+LIBRARY_DIR = os.environ.get("LIBRARY_DIR", "/library")
+APP_PORT = os.environ.get("APP_PORT", "")
+PAGE = "/photos/"
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T[0-9:.]+Z?)?\Z")
+KEY_NAME = "Wizard agent (Photos app)"
+# What the agent tools and immich-go need (immich-go docs/installation.md "API Permissions"), nothing more.
+KEY_PERMISSIONS = [
+    "asset.read", "asset.statistics", "asset.update", "asset.upload", "asset.copy", "asset.delete", "asset.download",
+    "asset.view", "album.create", "album.read", "albumAsset.create", "server.about", "server.statistics",
+    "server.storage", "stack.create", "tag.asset", "tag.create", "tag.read", "user.read", "job.create", "job.read",
+    "person.read", "person.statistics", "timeline.read",
+]
+IMMICH_GO = {
+    "version": "v0.32.0",
+    "amd64": ("https://github.com/simulot/immich-go/releases/download/v0.32.0/immich-go_Linux_x86_64.tar.gz",
+              "6e2ad86bafdadb9466d6515de7cb882726c0aea1a21d51164dff361d7d480a97"),
+    "arm64": ("https://github.com/simulot/immich-go/releases/download/v0.32.0/immich-go_Linux_arm64.tar.gz",
+              "2c35d9284baae407ef9540bdac5f488971b0bdc7be758a4d7c05ab270af09fdb"),
+}
+IMPORT_DEFAULTS = {"include_archived": True, "include_partner": True, "sync_albums": True, "include_trashed": False}
+LOCK = threading.Lock()
+RUN = {"proc": None}
+
+
+# ---------------- private state (0700 dir, 0600 files) ----------------
+
+def _state_path(name):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(STATE, 0o700)
+    except OSError:
+        pass
+    return os.path.join(STATE, name)
+
+
+def _read_json(name, default=None):
+    try:
+        with open(_state_path(name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(name, data):
+    p = _state_path(name)
+    tmp = p + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, p)
+
+
+# ---------------- Immich API ----------------
+
+def _immich(method, path, payload=None, key=None, cookie=None, timeout=30, raw=False):
+    """Call Immich's REST API. Returns (status, parsed JSON or bytes). Never raises for HTTP errors."""
+    headers = {"Accept": "application/json"}
+    if key:
+        headers["x-api-key"] = key
+    if cookie:
+        headers["Cookie"] = cookie
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    try:
+        code, body = http(method, "/api" + path, data, headers, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        code, body = e.code, e.read()
+    except OSError as e:
+        return 0, {"error": "Immich is not reachable yet (%s)" % type(e).__name__}
+    if raw:
+        return code, body
+    try:
+        return code, json.loads(body) if body else {}
+    except ValueError:
+        return code, {"raw": body[:200].decode("utf-8", "replace")}
+
+
+def _key():
+    return (_read_json("agent-key.json") or {}).get("secret") or ""
+
+
+def _api(method, path, payload=None, timeout=60):
+    key = _key()
+    if not key:
+        raise RuntimeError("The agent is not connected to Photos yet. Ask the owner to open Photos in Wizard, sign in "
+                           "to Immich and tap 'Let my agent help' (photos_status shows the exact step).")
+    code, body = _immich(method, path, payload, key=key, timeout=timeout)
+    if code == 401:
+        raise RuntimeError("Immich no longer accepts the agent's key (it was deleted in Immich). Ask the owner to tap "
+                           "'Let my agent help' again on the Photos page.")
+    if code == 0:
+        raise RuntimeError(body.get("error"))
+    if code >= 400:
+        raise RuntimeError("Immich answered %d: %s" % (code, (body.get("message") if isinstance(body, dict) else body)))
+    return body
+
+
+def _own_url(headers=None):
+    host = ""
+    for h in (os.environ.get("WIZARD_TRUSTED_HOSTS") or "").split(","):
+        name = h.strip().rsplit(":", 1)[0]
+        if name.endswith(".ts.net") or ("." in name and not name.replace(".", "").isdigit()):
+            host = name
+            break
+    if not host and headers:
+        host = (headers.get("host") or "").rsplit(":", 1)[0]
+    if not host or not APP_PORT:
+        return ""
+    return "https://%s:%s" % (host, APP_PORT)
+
+
+# ---------------- status ----------------
+
+def _du(path):
+    try:
+        st = os.statvfs(path)
+        return {"free_gb": round(st.f_bavail * st.f_frsize / 1e9, 1), "total_gb": round(st.f_blocks * st.f_frsize / 1e9, 1)}
+    except OSError:
+        return None
+
+
+def status(headers=None):
+    out = {"app": APP, "version": VERSION, "immich": {"reachable": False}, "agent_connected": False}
+    code, ping = _immich("GET", "/server/ping", timeout=5)
+    if code == 200:
+        out["immich"]["reachable"] = True
+        _, ver = _immich("GET", "/server/version", timeout=5)
+        if isinstance(ver, dict) and "major" in ver:
+            out["immich"]["version"] = "%s.%s.%s" % (ver["major"], ver["minor"], ver["patch"])
+        _, cfg = _immich("GET", "/server/config", timeout=5)
+        out["immich"]["has_owner_account"] = bool(cfg.get("isInitialized"))
+        out["immich"]["trash_days"] = cfg.get("trashDays")
+    key = _key()
+    if key and out["immich"]["reachable"]:
+        c, me = _immich("GET", "/users/me", key=key, timeout=10)
+        out["agent_connected"] = c == 200
+        if c == 200:
+            out["account"] = {"name": me.get("name"), "email": me.get("email"), "is_admin": me.get("isAdmin")}
+            c, stats = _immich("GET", "/server/statistics", key=key, timeout=20)
+            if c == 200:
+                out["library"] = {"photos": stats.get("photos"), "videos": stats.get("videos"),
+                                  "size_gb": round((stats.get("usage") or 0) / 1e9, 2)}
+            c, jobs = _immich("GET", "/jobs", key=key, timeout=10)
+            if c == 200:
+                out["background_work"] = {
+                    n: {"waiting": (jobs.get(n) or {}).get("jobCounts", {}).get("waiting", 0),
+                        "active": (jobs.get(n) or {}).get("jobCounts", {}).get("active", 0),
+                        "paused": (jobs.get(n) or {}).get("queueStatus", {}).get("isPaused", False)}
+                    for n in ("metadataExtraction", "thumbnailGeneration", "faceDetection", "facialRecognition",
+                              "smartSearch", "duplicateDetection", "videoConversion")}
+    out["disk"] = _du(LIBRARY_DIR) or _du(STATE)
+    out["import"] = import_summary()
+    own = _own_url(headers)
+    out["links"] = {"wizard": "?open=photos", **({"immich": own + "/", "mobile_server_url": own} if own else {})}
+    if not out["immich"]["reachable"]:
+        out["next"] = "Immich is starting (the first start takes a minute or two). Try again shortly."
+    elif not out["immich"]["has_owner_account"]:
+        out["next"] = ("The owner opens Photos in Wizard and creates his Immich admin account (Getting started): his "
+                       "email, a name and a password he chooses. Nobody else can do this step.")
+    elif not out["agent_connected"]:
+        out["next"] = "The owner taps 'Let my agent help' on the Photos page (while signed in to Immich)."
+    return out
+
+
+# ---------------- people and search ----------------
+
+def _person_ids(person):
+    if not person:
+        return []
+    wanted = [p.strip() for p in str(person).split(",") if p.strip()]
+    ids, everyone = [], None
+    for w in wanted:
+        if UUID_RE.match(w):
+            ids.append(w)
+            continue
+        if everyone is None:
+            everyone = _all_people()
+        hits = [p for p in everyone if (p.get("name") or "").strip().lower() == w.lower()]
+        if not hits:
+            hits = [p for p in everyone if w.lower() in (p.get("name") or "").lower()]
+        if len(hits) != 1:
+            names = sorted({p.get("name") for p in hits if p.get("name")})[:10]
+            raise ValueError("No single person named %r (%s). Use photos_people to get the exact id." %
+                             (w, "matches: " + ", ".join(names) if names else "no match"))
+        ids.append(hits[0]["id"])
+    return ids
+
+
+def _all_people(with_hidden=False):
+    people, page = [], 1
+    while page <= 50:
+        q = urllib.parse.urlencode({"page": page, "size": 500, "withHidden": "true" if with_hidden else "false"})
+        body = _api("GET", "/people?" + q)
+        people += body.get("people") or []
+        if not body.get("hasNextPage"):
+            break
+        page += 1
+    return people
+
+
+def people(name="", include_unnamed=False, limit=50):
+    limit = max(1, min(int(limit or 50), 500))
+    everyone = _all_people()
+    rows = [p for p in everyone if include_unnamed or (p.get("name") or "").strip()]
+    if name:
+        rows = [p for p in rows if name.lower() in (p.get("name") or "").lower()]
+    out = []
+    for i, p in enumerate(rows[:limit]):
+        row = {"id": p["id"], "name": p.get("name") or "(unnamed)", "favorite": p.get("isFavorite", False)}
+        if i < 40:
+            try:
+                row["photos"] = _api("GET", "/people/%s/statistics" % p["id"]).get("assets")
+            except RuntimeError:
+                pass
+        out.append(row)
+    unnamed = sum(1 for p in everyone if not (p.get("name") or "").strip())
+    return {"people": out, "shown": len(out), "named_total": len(everyone) - unnamed, "unnamed_faces_groups": unnamed,
+            "note": "Immich groups faces automatically after import. Name a face group in Immich (People) and it "
+                    "shows here by name."}
+
+
+def _filters(person="", taken_after="", taken_before="", media_type="", city="", favorite=None, album_id=""):
+    f = {}
+    ids = _person_ids(person)
+    if ids:
+        f["personIds"] = ids
+    for k, v in (("takenAfter", taken_after), ("takenBefore", taken_before)):
+        if v:
+            if not DATE_RE.match(str(v)):
+                raise ValueError("%s must be a date like 2019-06-30" % k)
+            f[k] = v if "T" in v else v + ("T00:00:00.000Z" if k == "takenAfter" else "T23:59:59.999Z")
+    if media_type:
+        t = str(media_type).upper()
+        if t not in ("IMAGE", "VIDEO"):
+            raise ValueError("media_type is IMAGE or VIDEO")
+        f["type"] = t
+    if city:
+        f["city"] = city
+    if favorite is not None:
+        f["isFavorite"] = bool(favorite)
+    if album_id:
+        if not UUID_RE.match(album_id):
+            raise ValueError("album_id must be an Immich album id")
+        f["albumIds"] = [album_id]
+    return f
+
+
+def _asset_row(a, own):
+    ex = a.get("exifInfo") or {}
+    row = {"id": a["id"], "file": a.get("originalFileName"), "type": a.get("type"),
+           "taken": a.get("localDateTime") or a.get("fileCreatedAt"),
+           "people": [p.get("name") for p in (a.get("people") or []) if p.get("name")],
+           "place": ", ".join(x for x in (ex.get("city"), ex.get("country")) if x) or None}
+    if own:
+        row["open"] = "%s/photos/%s" % (own, a["id"])
+    return row
+
+
+def search(query="", person="", taken_after="", taken_before="", media_type="", city="", favorite=None, limit=25):
+    limit = max(1, min(int(limit or 25), 200))
+    f = _filters(person, taken_after, taken_before, media_type, city, favorite)
+    own = _own_url()
+    if query:
+        body = _api("POST", "/search/smart", dict(f, query=str(query)[:500], size=limit, withExif=True))
+        items = (body.get("assets") or {}).get("items") or []
+        return {"mode": "smart (meaning-based, best matches first)", "shown": len(items),
+                "assets": [_asset_row(a, own) for a in items]}
+    total = _api("POST", "/search/statistics", f).get("total")
+    body = _api("POST", "/search/metadata", dict(f, size=limit, withExif=True, withPeople=True, order="desc"))
+    items = (body.get("assets") or {}).get("items") or []
+    return {"mode": "filters", "total_matching": total, "shown": len(items), "assets": [_asset_row(a, own) for a in items]}
+
+
+# ---------------- trash (never a permanent delete) ----------------
+
+def _matching_ids(f, cap=50000):
+    ids, page = [], 1
+    while len(ids) < cap:
+        body = _api("POST", "/search/metadata", dict(f, size=1000, page=page), timeout=120)
+        a = body.get("assets") or {}
+        ids += [x["id"] for x in a.get("items") or []]
+        if not a.get("nextPage"):
+            break
+        page = int(a["nextPage"])
+    return ids[:cap]
+
+
+def move_to_trash(asset_ids=None, person="", taken_after="", taken_before="", media_type="", expected_count=None,
+                  confirmed=False):
+    asset_ids = [str(x) for x in (asset_ids or [])]
+    bad = [x for x in asset_ids if not UUID_RE.match(x)]
+    if bad:
+        raise ValueError("not Immich asset ids: %s" % ", ".join(bad[:5]))
+    if asset_ids and (person or taken_after or taken_before or media_type):
+        raise ValueError("Give either asset_ids or filters, not both.")
+    trash_days = (_immich("GET", "/server/config", timeout=5)[1] or {}).get("trashDays", 30)
+    if asset_ids:
+        count = len(set(asset_ids))
+        ids = sorted(set(asset_ids))
+        f = None
+    else:
+        if not (person or taken_after or taken_before):
+            raise ValueError("Say which photos: a person and/or a date range (taken_after/taken_before), or asset_ids. "
+                             "This tool never trashes the whole library.")
+        f = _filters(person, taken_after, taken_before, media_type)
+        count = _api("POST", "/search/statistics", f).get("total") or 0
+        ids = None
+    if not confirmed:
+        sample = []
+        if f is not None and count:
+            body = _api("POST", "/search/metadata", dict(f, size=5, withPeople=True, withExif=True))
+            sample = [_asset_row(a, _own_url()) for a in (body.get("assets") or {}).get("items") or []]
+        return {"preview": True, "would_move_to_trash": count, "sample": sample,
+                "next": "Tell the owner exactly how many photos/videos this is and get his yes. Then call again with "
+                        "confirmed=true and expected_count=%d. They go to Immich's trash (kept %s days, restorable), "
+                        "not deleted." % (count, trash_days)}
+    if expected_count is None or int(expected_count) != count:
+        raise ValueError("The matching set is now %d items, not %s. Preview again and re-confirm with the owner." %
+                         (count, expected_count))
+    if ids is None:
+        ids = _matching_ids(f)
+        if len(ids) != count:
+            raise ValueError("Found %d ids for %d matches; nothing moved. Try again." % (len(ids), count))
+    moved = 0
+    for i in range(0, len(ids), 500):
+        _api("DELETE", "/assets", {"ids": ids[i:i + 500], "force": False}, timeout=300)
+        moved += len(ids[i:i + 500])
+    return {"moved_to_trash": moved, "restorable_for_days": trash_days,
+            "undo": "photos_restore_from_trash with the same asset ids, or Immich > Trash > Restore."}
+
+
+def restore_from_trash(asset_ids=None, everything=False):
+    asset_ids = [str(x) for x in (asset_ids or []) if UUID_RE.match(str(x))]
+    if everything:
+        body = _api("POST", "/trash/restore")
+        return {"restored": body.get("count"), "scope": "everything in the trash"}
+    if not asset_ids:
+        raise ValueError("Give asset_ids, or everything=true to restore the whole trash.")
+    n = 0
+    for i in range(0, len(asset_ids), 500):
+        body = _api("POST", "/trash/restore/assets", {"ids": asset_ids[i:i + 500]})
+        n += body.get("count") or 0
+    return {"restored": n}
+
+
+# ---------------- Google Takeout import (immich-go) ----------------
+
+def _zips():
+    try:
+        names = sorted(os.listdir(IMPORT_DIR))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        p = os.path.join(IMPORT_DIR, n)
+        if n.lower().endswith((".zip", ".tgz", ".tar.gz")) and not n.startswith(".") and os.path.isfile(p):
+            st = os.stat(p)
+            out.append({"name": n, "size_gb": round(st.st_size / 1e9, 2), "modified": int(st.st_mtime)})
+    return out
+
+
+def import_options():
+    saved = _read_json("import-options.json", {}) or {}
+    return {k: saved.get(k, v) if isinstance(saved.get(k), bool) else v for k, v in IMPORT_DEFAULTS.items()}
+
+
+def set_import_options(d):
+    if not isinstance(d, dict) or set(d) - set(IMPORT_DEFAULTS) or not all(isinstance(v, bool) for v in d.values()):
+        raise ValueError("options are booleans: " + ", ".join(IMPORT_DEFAULTS))
+    _write_json("import-options.json", dict(import_options(), **d))
+    return import_options()
+
+
+LINE_RE = re.compile(r"(uploaded|server duplicate|local duplicate|error|discarded|already|skipped|album)", re.I)
+
+
+def _log_tail(path, n=12):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    key = _key()
+    return [(l.replace(key, "***") if key else l)[:300] for l in lines[-n:]]
+
+
+def import_summary():
+    st = _read_json("import.json", {}) or {}
+    running = bool(RUN["proc"] and RUN["proc"].poll() is None)
+    if st.get("state") == "running" and not running:
+        st["state"] = "interrupted"
+    zips = _zips()
+    out = {"state": st.get("state", "idle"), "drop_folder": "Files > Photos > Import",
+           "waiting_files": len(zips), "waiting_gb": round(sum(z["size_gb"] for z in zips), 2)}
+    for k in ("started_at", "finished_at", "exit_code", "files", "message"):
+        if k in st:
+            out[k] = st[k]
+    return out
+
+
+def import_status():
+    st = _read_json("import.json", {}) or {}
+    out = import_summary()
+    out["files_in_drop_folder"] = _zips()
+    out["options"] = import_options()
+    if st.get("log"):
+        out["log_tail"] = _log_tail(st["log"])
+    out["how"] = ("Google Takeout: choose only Google Photos, .zip, 50 GB parts. Put every part in Files > Photos > "
+                  "Import (or upload them there from a computer), then start the import. Running it again is safe: "
+                  "photos already in Immich are skipped.")
+    return out
+
+
+def _arch():
+    m = os.uname().machine
+    return "arm64" if m in ("aarch64", "arm64") else "amd64"
+
+
+def _immich_go():
+    url, sha = IMMICH_GO[_arch()]
+    bindir = _state_path("bin")
+    os.makedirs(bindir, mode=0o700, exist_ok=True)
+    exe = os.path.join(bindir, "immich-go-" + IMMICH_GO["version"])
+    if os.path.isfile(exe):
+        return exe
+    with urllib.request.urlopen(url, timeout=300) as r:
+        blob = r.read()
+    if hashlib.sha256(blob).hexdigest() != sha:
+        raise RuntimeError("immich-go download did not match its pinned checksum; not running it")
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as t:
+        member = t.getmember("immich-go")
+        data = t.extractfile(member).read()
+    tmp = exe + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, 0o700)
+    os.replace(tmp, exe)
+    return exe
+
+
+def _run_import(files, opts):
+    st = {"state": "running", "started_at": int(time.time()), "files": [z["name"] for z in files]}
+    logdir = _state_path("import-logs")
+    os.makedirs(logdir, mode=0o700, exist_ok=True)
+    st["log"] = os.path.join(logdir, time.strftime("%Y%m%d-%H%M%S") + ".log")
+    _write_json("import.json", st)
+    try:
+        exe = _immich_go()
+        server = "http://%s:%d" % (UP_HOST, UP_PORT)
+        env = {"PATH": "/usr/bin:/bin", "HOME": STATE, "TMPDIR": _state_path("tmp"),
+               "IMMICH_GO_UPLOAD_SERVER": server, "IMMICH_GO_UPLOAD_API_KEY": _key(),
+               "IMMICH_GO_UPLOAD_ADMIN_API_KEY": _key()}
+        os.makedirs(env["TMPDIR"], mode=0o700, exist_ok=True)
+        argv = [exe, "upload", "from-google-photos", "--no-ui", "--on-errors=continue", "--concurrent-tasks=4",
+                "--log-file=" + st["log"], "--client-timeout=60m",
+                "--include-archived=%s" % str(opts["include_archived"]).lower(),
+                "--include-partner=%s" % str(opts["include_partner"]).lower(),
+                "--sync-albums=%s" % str(opts["sync_albums"]).lower(),
+                "--include-trashed=%s" % str(opts["include_trashed"]).lower(),
+                "--people-tag=true", "--takeout-tag=true"] + [os.path.join(IMPORT_DIR, z["name"]) for z in files]
+        with open(st["log"] + ".out", "ab") as out:
+            RUN["proc"] = subprocess.Popen(argv, env=env, cwd=STATE, stdout=out, stderr=subprocess.STDOUT)
+            code = RUN["proc"].wait()
+        st.update(state="done" if code == 0 else "failed", exit_code=code, finished_at=int(time.time()))
+        if code:
+            st["message"] = " | ".join(_log_tail(st["log"] + ".out", 3))[:600]
+    except Exception as e:
+        st.update(state="failed", finished_at=int(time.time()), message="%s: %s" % (type(e).__name__, e))
+    finally:
+        RUN["proc"] = None
+        _write_json("import.json", st)
+
+
+def import_start(confirmed=False):
+    with LOCK:
+        if RUN["proc"] and RUN["proc"].poll() is None:
+            return {"started": False, "state": "running", "message": "An import is already running."}
+        files = _zips()
+        if not files:
+            return {"started": False, "message": "No Takeout files yet. Put the .zip parts in Files > Photos > Import."}
+        if not _key():
+            raise RuntimeError("Connect the agent first: the owner taps 'Let my agent help' on the Photos page.")
+        if not confirmed:
+            return {"started": False, "preview": True, "files": files,
+                    "next": "Call again with confirmed=true to import these %d file(s) into Immich." % len(files)}
+        opts = import_options()
+        threading.Thread(target=_run_import, args=(files, opts), daemon=True).start()
+        for _ in range(20):
+            if (_read_json("import.json", {}) or {}).get("state") == "running":
+                break
+            time.sleep(0.1)
+    return {"started": True, "files": [z["name"] for z in files], "options": opts,
+            "note": "Large Takeouts take hours. Face grouping and search indexing run after the upload."}
+
+
+def _prepare_import_dir():
+    """Let the Files app (uid 1000) drop Takeout files here: group 1000, setgid, group-writable. Never recursive."""
+    try:
+        st = os.stat(IMPORT_DIR)
+        if st.st_gid != 1000:
+            os.chown(IMPORT_DIR, -1, 1000)
+        if (st.st_mode & 0o7777) != 0o2775:
+            os.chmod(IMPORT_DIR, 0o2775)
+    except OSError as e:
+        print("photos: could not prepare %s (%s)" % (IMPORT_DIR, e), flush=True)
+
+
+STARTUP.append(_prepare_import_dir)
+
+
+# ---------------- agent connection (owner's Immich session, one tap) ----------------
+
+def _session_cookie(headers):
+    jar = {}
+    for part in (headers.get("cookie") or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k:
+            jar[k] = v
+    keep = {k: jar[k] for k in ("immich_access_token", "immich_auth_type", "immich_is_authenticated") if k in jar}
+    return "; ".join("%s=%s" % kv for kv in keep.items()) if "immich_access_token" in keep else ""
+
+
+def connect(headers):
+    cookie = _session_cookie(headers)
+    if not cookie:
+        return 401, {"error": "Sign in to Photos (Immich) first, then tap again.", "code": "signin_needed"}
+    c, me = _immich("GET", "/users/me", cookie=cookie)
+    if c != 200:
+        return 401, {"error": "Your Immich sign-in has expired. Sign in again, then tap again.", "code": "signin_needed"}
+    if not me.get("isAdmin"):
+        return 403, {"error": "Only the Photos owner (Immich admin) can connect the agent.", "code": "owner_only"}
+    old = _read_json("agent-key.json") or {}
+    if old.get("id"):
+        _immich("DELETE", "/api-keys/%s" % old["id"], cookie=cookie)
+    c, made = _immich("POST", "/api-keys", {"name": KEY_NAME, "permissions": KEY_PERMISSIONS}, cookie=cookie)
+    if c not in (200, 201) or not made.get("secret"):
+        return 502, {"error": "Immich did not create the key (%s)." % c}
+    _write_json("agent-key.json", {"id": (made.get("apiKey") or {}).get("id"), "secret": made["secret"],
+                                    "user": me.get("email"), "created_at": int(time.time())})
+    return 200, {"connected": True, "account": me.get("email")}
+
+
+def disconnect(headers):
+    old = _read_json("agent-key.json") or {}
+    cookie = _session_cookie(headers)
+    revoked = False
+    if old.get("id") and cookie:
+        c, _ = _immich("DELETE", "/api-keys/%s" % old["id"], cookie=cookie)
+        revoked = c in (200, 204)
+    try:
+        os.remove(_state_path("agent-key.json"))
+    except OSError:
+        pass
+    return 200, {"connected": False, "key_revoked_in_immich": revoked}
+
+
+# ---------------- MCP tools (box-only: the agent through the Wizard hub) ----------------
+
+def _box_only():
+    h = REQUEST.get()
+    if any(h.get(k) for k in ("tailscale-user-login", "x-forwarded-for", "forwarded", "cf-connecting-ip",
+                              "cf-access-jwt-assertion", "x-real-ip")):
+        raise PermissionError("the Photos tools are only for apps on this box")
+
+
+@tool("photos_status", "Photos (Immich) status: whether Immich is up and the owner's account exists, whether the agent "
+      "is connected, library size (photos, videos, GB), background work still running (face detection, face "
+      "grouping, search indexing), Google Takeout import state, free disk, links, and the owner's next step.")
+def photos_status():
+    _box_only()
+    return status()
+
+
+@tool("photos_people", "List the people Immich recognised by face (face groups), with how many photos each is in. "
+      "Named people by default; include_unnamed=true also lists face groups the owner has not named yet.",
+      {"name": {"type": "string", "description": "Only people whose name contains this"},
+       "include_unnamed": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}})
+def photos_people(name="", include_unnamed=False, limit=50):
+    _box_only()
+    return people(name, include_unnamed, limit)
+
+
+@tool("photos_search", "Find photos and videos. With `query` it is a meaning-based search (e.g. 'beach at sunset', "
+      "'birthday cake'); without it, filter by person, dates, type, city or favourite and get the total count. "
+      "Returns ids, file names, dates, people and an `open` link per item.",
+      {"query": {"type": "string"}, "person": {"type": "string", "description": "Person name or id; several comma-separated means photos with all of them"},
+       "taken_after": {"type": "string", "description": "YYYY-MM-DD"}, "taken_before": {"type": "string", "description": "YYYY-MM-DD"},
+       "media_type": {"type": "string", "enum": ["IMAGE", "VIDEO"]}, "city": {"type": "string"},
+       "favorite": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}})
+def photos_search(query="", person="", taken_after="", taken_before="", media_type="", city="", favorite=None, limit=25):
+    _box_only()
+    return search(query, person, taken_after, taken_before, media_type, city, favorite, limit)
+
+
+@tool("photos_move_to_trash", "Move photos/videos to Immich's TRASH (restorable for the trash period, 30 days by "
+      "default; never a permanent delete). Pick them by asset_ids, or by person and/or date range. First call without "
+      "confirmed: it returns the exact count and a sample. Tell the owner the count, get his explicit yes, then call "
+      "again with confirmed=true and expected_count equal to that count.",
+      {"asset_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 5000},
+       "person": {"type": "string"}, "taken_after": {"type": "string"}, "taken_before": {"type": "string"},
+       "media_type": {"type": "string", "enum": ["IMAGE", "VIDEO"]},
+       "expected_count": {"type": "integer"}, "confirmed": {"type": "boolean"}})
+def photos_move_to_trash(asset_ids=None, person="", taken_after="", taken_before="", media_type="", expected_count=None,
+                         confirmed=False):
+    _box_only()
+    return move_to_trash(asset_ids, person, taken_after, taken_before, media_type, expected_count, confirmed)
+
+
+@tool("photos_restore_from_trash", "Undo: bring photos back from Immich's trash, by asset_ids or everything=true.",
+      {"asset_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 5000}, "everything": {"type": "boolean"}})
+def photos_restore_from_trash(asset_ids=None, everything=False):
+    _box_only()
+    return restore_from_trash(asset_ids, everything)
+
+
+@tool("photos_import_status", "Google Takeout import: Takeout files waiting in Files > Photos > Import, whether an "
+      "import is running, done or failed, its options and the last log lines.")
+def photos_import_status():
+    _box_only()
+    return import_status()
+
+
+@tool("photos_import_start", "Import every Google Takeout file in Files > Photos > Import into Immich with immich-go "
+      "(keeps dates, places, descriptions and albums from Google's JSON files; skips photos already imported). "
+      "Without confirmed it only lists what would be imported.",
+      {"confirmed": {"type": "boolean"}})
+def photos_import_start(confirmed=False):
+    _box_only()
+    return import_start(confirmed)
+
+
+# ---------------- owner page and its API ----------------
+
+def _json(code, obj, extra=None):
+    return (code, "application/json", json.dumps(obj).encode()) + ((extra,) if extra else ())
+
+
+_LOCAL = ("127.0.0.1", "localhost")
+
+
+def _trusted(headers, write):
+    host = (headers.get("host") or "").strip().lower()
+    hosts = {h.strip().lower() for h in (os.environ.get("WIZARD_TRUSTED_HOSTS") or "").split(",") if h.strip()}
+    if hosts and host not in hosts and host.rsplit(":", 1)[0] not in _LOCAL:
+        return False
+    login = (headers.get("tailscale-user-login") or "").strip().lower()
+    owners = {x.strip().lower() for x in (os.environ.get("WIZARD_OWNER_LOGINS") or "").split(",") if x.strip()}
+    if owners and login and login not in owners:
+        return False
+    if headers.get("sec-fetch-site", "same-origin") not in ("same-origin", "none"):
+        return False
+    origin = headers.get("origin")
+    if write and origin and urllib.parse.urlsplit(origin).netloc.lower() != host:
+        return False
+    return True
+
+
+def _body(headers, body):
+    if (headers.get("content-type") or "").split(";")[0].strip() != "application/json" or len(body) > 8192:
+        raise ValueError("send JSON")
+    d = json.loads(body or b"{}")
+    if not isinstance(d, dict):
+        raise ValueError("send a JSON object")
+    return d
+
+
+# ---- wizard.app-switches/1 (wizard-os docs/APP_SWITCHES.md) ----
+# Owner feature switches. New features ship behind one, off by default: append it to SWITCHES
+# ({"id", "name", "description", "default": False, "issues": ["oscarhenrycollins/photos#N"]}) and gate it on
+# switch_on(id). Kept on the box (STATE_DIR/switches.json). Owner only: the box's Tailscale Serve login with
+# X-Wizard-Switch: 1; never a bearer or a box-local host.
+SWITCHES = []
+_SW_LOCAL = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
+
+
+def switches_doc():
+    saved = _read_json("switches.json", {}) or {}
+    return {"contract": "wizard.app-switches/1", "switches": [
+        dict(x, on=saved[x["id"]] if isinstance(saved.get(x["id"]), bool) else bool(x.get("default"))) for x in SWITCHES]}
+
+
+def switch_on(switch_id):
+    return next((x["on"] for x in switches_doc()["switches"] if x["id"] == switch_id), False)
+
+
+def _sw_owner(headers, write):
+    if headers.get("authorization") or headers.get("x-wizard-switch") != "1":
+        return False
+    host = (headers.get("host") or "").strip().lower()
+    name = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
+    if not name or name in _SW_LOCAL or "." not in name:
+        return False
+    origin = headers.get("origin")
+    if origin and urllib.parse.urlsplit(origin).netloc.lower() != host:
+        return False
+    if write and not origin:
+        return False
+    login = headers.get("tailscale-user-login") or ""
+    owners = {x.strip().lower() for x in (os.environ.get("WIZARD_OWNER_LOGINS") or "").split(",") if x.strip()}
+    return "@" in login and "," not in login and (not owners or login.strip().lower() in owners)
+
+
+def switches_route(method, headers, body):
+    if method in ("GET", "HEAD"):
+        if not _sw_owner(headers, False):
+            return _json(403, {"error": "Only this Wizard's owner can see these switches.", "code": "owner_only"})
+        return _json(200, switches_doc())
+    if method != "POST":
+        return _json(405, {"error": "method"})
+    if not _sw_owner(headers, True):
+        return _json(403, {"error": "Only this Wizard's owner can change these switches.", "code": "owner_only"})
+    try:
+        d = _body(headers, body)
+        if not isinstance(d.get("id"), str) or not isinstance(d.get("on"), bool) or set(d) - {"id", "on"}:
+            raise ValueError
+    except (ValueError, TypeError):
+        return _json(400, {"error": 'Send JSON {"id": "...", "on": true|false}', "code": "invalid_input"})
+    if d["id"] not in {x["id"] for x in SWITCHES}:
+        return _json(404, {"error": "No such switch", "code": "unknown_switch"})
+    ids = {x["id"] for x in SWITCHES}
+    saved = {k: v for k, v in (_read_json("switches.json", {}) or {}).items() if k in ids and isinstance(v, bool)}
+    saved[d["id"]] = d["on"]
+    _write_json("switches.json", saved)
+    return _json(200, switches_doc())
+
+
+@route("/api/switches", match=lambda p: p.rstrip("/") == "/api/switches")
+def switches_bare_route(method, path, query, headers, body):
+    return switches_route(method, headers, body)
+# ---- end wizard.app-switches/1 ----
+
+
+def _health():
+    code, _ = _immich("GET", "/server/ping", timeout=3)
+    return {"ok": True, "app": APP, "version": VERSION, "immich": code == 200}
+
+
+@route("/healthz", match=lambda p: p == "/healthz")
+def health_route(method, path, query, headers, body):
+    return _json(200, _health())
+
+
+MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+        ".png": "image/png", ".svg": "image/svg+xml", ".json": "application/json"}
+CSP = ("default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
+       "frame-src https: http:; connect-src 'self'; frame-ancestors 'self'")
+
+
+def _page_path(p):
+    """Wizard owns /photos/ and its own files; Immich keeps /photos and /photos/<asset-uuid>[/...]."""
+    if not p.startswith(PAGE):
+        return False
+    first = p[len(PAGE):].split("/", 1)[0]
+    return not UUID_RE.match(first)
+
+
+@route(PAGE, match=_page_path)
+def page_route(method, path, query, headers, body):
+    sub = path[len(PAGE):]
+    if sub in ("healthz",):
+        return _json(200, _health())
+    if sub in ("api/switches", "api/switches/"):
+        return switches_route(method, headers, body)
+    if sub.startswith("api/"):
+        write = method not in ("GET", "HEAD")
+        if not _trusted(headers, write):
+            return _json(403, {"error": "Open Photos from your Wizard.", "code": "owner_only"})
+        try:
+            if method == "GET" and sub == "api/status":
+                return _json(200, status(headers))
+            if method == "GET" and sub == "api/import":
+                return _json(200, import_status())
+            if method == "GET" and sub == "api/import/options":
+                return _json(200, {"options": import_options()})
+            if method == "POST" and sub == "api/import/options":
+                return _json(200, {"options": set_import_options(_body(headers, body))})
+            if method == "POST" and sub == "api/import/start":
+                _body(headers, body)
+                return _json(200, import_start(True))
+            if method == "POST" and sub == "api/connect":
+                _body(headers, body)
+                return _json(*connect(headers))
+            if method == "POST" and sub == "api/disconnect":
+                _body(headers, body)
+                return _json(*disconnect(headers))
+        except (ValueError, RuntimeError) as e:
+            return _json(400, {"error": str(e)})
+        return _json(404, {"error": "not found"})
+    if method not in ("GET", "HEAD"):
+        return _json(405, {"error": "method"})
+    name = sub or "index.html"
+    if name in VENDOR:
+        ext = "." + name.rsplit(".", 1)[-1]
+        extra = {"Content-Security-Policy": CSP} if ext == ".html" else None
+        out = (200, MIME.get(ext, "application/octet-stream"), base64.b64decode(VENDOR[name]))
+        return out + ((extra,) if extra else ())
+    return _json(404, {"error": "not found"})

@@ -1,0 +1,11 @@
+{
+  "round_trip": [
+    {"do": "GET /photos/api/import/options", "name": "read defaults", "expect": {"options.include_trashed": false, "options.sync_albums": true}},
+    {"do": "POST /photos/api/import/options", "name": "save option", "body": {"include_trashed": true, "include_partner": false}, "status": 200,
+     "expect": {"options.include_trashed": true, "options.include_partner": false}},
+    {"do": "GET /photos/api/status", "name": "status without Immich", "expect": {"immich.reachable": false, "agent_connected": false}},
+    {"restart": true},
+    {"do": "GET /photos/api/import/options", "name": "read back after restart", "expect": {"options.include_trashed": true, "options.include_partner": false, "options.sync_albums": true}},
+    {"do": "POST /photos/api/import/options", "name": "reset", "body": {"include_trashed": false, "include_partner": true}, "status": 200}
+  ]
+}

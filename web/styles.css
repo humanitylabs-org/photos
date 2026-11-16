@@ -1,0 +1,15 @@
+/* Photos-only layout. Everything shared (type, rows, sheets, colours) comes from wizard-ui.css. */
+.ph-app { display: flex; flex-direction: column; height: 100dvh; min-height: 0; }
+.ph-head { flex: none; }
+.ph-head p { margin: 2px 0 8px; }
+.ph-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ph-actions a.wz-chip { text-decoration: none; }
+.ph-setup { margin: var(--wz-space-2) var(--wz-space-3); }
+.ph-setup h2 { margin: 0 0 6px; }
+.ph-frame-wrap { flex: 1; min-height: 0; margin: 8px 0 0; border-top: 1px solid var(--wz-border); }
+.ph-frame-wrap iframe { display: block; width: 100%; height: 100%; border: 0; background: var(--wz-canvas); }
+.ph-steps { margin: 0 0 12px; padding-left: 1.2em; line-height: 1.45; }
+.ph-steps li { margin: 0 0 6px; }
+.ph-help { line-height: 1.45; margin: 0 0 10px; }
+.ph-import-state { margin: 0 0 10px; font-weight: 600; }
+.ph-log { max-height: 30vh; overflow: auto; font-family: var(--wz-font-mono); font-size: var(--wz-text-sm); white-space: pre-wrap; margin: 10px 0 0; }

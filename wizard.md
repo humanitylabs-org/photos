@@ -4,7 +4,7 @@ id: photos
 name: Photos
 type: view
 category: app
-tags: [media]
+tags: [photos]
 version: 0.1.0
 summary: Your own Google Photos on your Wizard (Immich). Import from Google Takeout, group faces, clean up, back up your phone.
 icon: icon.png

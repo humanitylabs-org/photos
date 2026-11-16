@@ -197,6 +197,16 @@ async def handle(reader, writer):
     for prefix, fn in ROUTES.items():
         if (path == prefix.rstrip("/") or path.startswith(prefix)) and ROUTE_MATCH.get(prefix, bool)(path or "/"):
             return await serve_route(reader, writer, fn, parts[0], parts[1], rest)
+    hdrs = {}
+    if INTERCEPTS or HEAD_REWRITE:
+        for l in rest.decode("latin-1").split("\r\n"):
+            if ":" in l:
+                k, v = l.split(":", 1)
+                hdrs[k.strip().lower()] = v.strip()
+        for hook in INTERCEPTS:
+            fn = hook(parts[0], parts[1] if len(parts) >= 3 else "", hdrs)
+            if fn:
+                return await serve_route(reader, writer, fn, parts[0], parts[1], rest)
     if not UP_HOST:
         return await respond(writer, 404, {"error": "not found"})
     try:
@@ -206,6 +216,8 @@ async def handle(reader, writer):
     # One request per proxied connection (unless it is an upgrade such as a WebSocket), so a
     # later /mcp request can never ride an upstream keep-alive connection.
     lines = [l for l in head.decode("latin-1").split("\r\n") if l]
+    for hook in HEAD_REWRITE:
+        lines = hook(parts[0], parts[1] if len(parts) >= 3 else "", hdrs, lines)
     if STRIP_FORWARDED:
         # The engine sees this front as its only client: Home Assistant answers 400 to forwarded headers from a
         # proxy it was not told to trust, so a visit through Tailscale Serve or a tunnel would otherwise fail.
@@ -219,6 +231,11 @@ async def handle(reader, writer):
 
 
 STARTUP = []  # fn() called once before serving (an app's own background threads)
+# Proxy hooks (no I/O: they run on the event loop). INTERCEPTS: fn(method, target, headers) -> a route fn that answers
+# this request here instead of the engine, or None. HEAD_REWRITE: fn(method, target, headers, lines) -> the request
+# head lines sent to the engine (lines[0] is the request line).
+INTERCEPTS = []
+HEAD_REWRITE = []
 
 
 async def main():

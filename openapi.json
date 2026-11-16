@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Photos (Wizard page API)",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "The Wizard page's own API at /photos/api. Same-origin, owner's shell origins only. Immich's API (https://api.immich.app) is served unchanged at /api on the same port."
   },
   "paths": {
@@ -74,32 +74,6 @@
         "responses": {
           "200": {
             "description": "started or why not"
-          }
-        }
-      }
-    },
-    "/photos/api/connect": {
-      "post": {
-        "summary": "Create the agent's narrow Immich API key from the signed-in owner's Immich session",
-        "responses": {
-          "200": {
-            "description": "connected"
-          },
-          "401": {
-            "description": "sign in to Immich first"
-          },
-          "403": {
-            "description": "not the Immich admin"
-          }
-        }
-      }
-    },
-    "/photos/api/disconnect": {
-      "post": {
-        "summary": "Forget (and revoke, when signed in) the agent's key",
-        "responses": {
-          "200": {
-            "description": "disconnected"
           }
         }
       }

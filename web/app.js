@@ -36,7 +36,7 @@ function render(s) {
   const im = s.immich || {};
   let line = '';
   if (!im.reachable) line = 'Starting Immich…';
-  else if (!im.has_owner_account) line = 'Create your Photos account to begin';
+  else if (!im.has_owner_account || !s.agent_connected) line = 'Setting up…';
   else if (s.library) line = n(s.library.photos) + ' photos · ' + n(s.library.videos) + ' videos · ' + (s.library.size_gb || 0) + ' GB';
   else line = 'Immich ' + (im.version || '');
   const busy = s.background_work && Object.values(s.background_work).reduce((a, q) => a + (q.waiting || 0) + (q.active || 0), 0);
@@ -49,23 +49,19 @@ function render(s) {
     setupCard('Open Photos from your Wizard', 'This page needs your Wizard\u2019s private address to show your library.');
   } else if (!im.reachable) {
     setupCard('Photos is starting', 'The first start takes a minute or two. This page refreshes on its own.');
-  } else if (!im.has_owner_account) {
-    setupCard('Create your Photos account', 'Below, tap Getting started and enter your email, your name and a password you choose. This is your own account on your own box; Google is not involved.');
+  } else if (!(s.sign_in && s.sign_in.ready)) {
+    setupCard('Photos is setting up', (s.sign_in && s.sign_in.problem) || 'Photos makes its own library for you; there is nothing to sign in to. This page refreshes on its own.');
   }
   el('open-full').hidden = !own;
   if (own) el('open-full').href = own;
   const frame = el('immich');
-  if (own && im.reachable) {
+  if (own && im.reachable && s.sign_in && s.sign_in.ready) {
     el('frame-wrap').hidden = false;
     if (!frame.getAttribute('src')) frame.src = own;
   }
-  const connected = !!s.agent_connected;
-  el('agent-line').textContent = connected
-    ? 'Your agent is connected' + (s.account && s.account.email ? ' (as ' + s.account.email + ').' : '.')
-    : (im.has_owner_account ? 'Sign in to Photos below first, then tap Let my agent help.' : 'Create your Photos account first.');
-  el('agent-go').hidden = connected;
-  el('agent-off').hidden = !connected;
-  el('agent-go').disabled = !im.has_owner_account;
+  const phone = s.links && s.links.mobile_server_url;
+  el('phone-line').textContent = phone ? 'Phone backup: install the Immich app, type ' + phone + ' as the server, tap Next, then Continue. Keep Tailscale on.' : '';
+  el('agent-line').textContent = s.agent_connected ? 'Your agent is connected to Photos.' : 'Your agent connects by itself once Photos has finished setting up.';
 }
 
 function renderImport(d) {
@@ -74,7 +70,7 @@ function renderImport(d) {
     failed: 'The last import stopped: ' + (d.message || 'see the log below.'), interrupted: 'The last import was interrupted. Import again to continue; nothing is duplicated.' };
   el('import-state').textContent = (words[st] || st) + ' ' + (d.waiting_files ? d.waiting_files + ' file(s), ' + d.waiting_gb + ' GB in Files › Photos › Import.' : 'No Takeout files in Files › Photos › Import yet.');
   el('import-go').disabled = st === 'running' || !d.waiting_files || !(state && state.agent_connected);
-  if (!(state && state.agent_connected) && d.waiting_files) el('import-state').textContent += ' Connect the agent first (Agent button): the import uses the same key.';
+  if (!(state && state.agent_connected) && d.waiting_files) el('import-state').textContent += ' Photos is still setting up; Import now works in a minute.';
   const list = el('import-options'); list.replaceChildren();
   const labels = { include_archived: 'Include archived photos', include_partner: 'Include partner-shared photos', sync_albums: 'Recreate my Google albums', include_trashed: 'Include photos in Google\u2019s trash' };
   for (const [k, label] of Object.entries(labels)) {
@@ -115,22 +111,10 @@ el('import-go').onclick = async () => {
   catch (e) { say(e.message, 'error'); }
   try { renderImport(await request('api/import')); } catch (e) {}
 };
-el('agent-go').onclick = async () => {
-  el('agent-go').disabled = true;
-  try { await request('api/connect', {}); say('Your agent is connected to Photos.', 'note'); }
-  catch (e) { say(e.message, 'error'); }
-  await refresh();
-};
-el('agent-off').onclick = async () => {
-  try { const r = await request('api/disconnect', {}); say(r.key_revoked_in_immich ? 'Agent access removed.' : 'Agent access removed here. Also delete the key in Immich › Account settings › API keys.', 'note'); }
-  catch (e) { say(e.message, 'error'); }
-  await refresh();
-};
-
 if (!window.WizardApp || WizardApp.version !== 1) {
   say('Wizard system functions are unavailable. Open Photos through Wizard.', 'error');
 } else {
-  WizardApp.ready({ name: 'Photos', version: '0.1.0' });
+  WizardApp.ready({ name: 'Photos', version: '0.2.0' });
   WizardApp.back.register({ canGoBack: () => false, back: () => false });
 }
 

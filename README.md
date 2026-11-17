@@ -34,3 +34,11 @@ Edit `mcp/front.py`, `mcp/tools.py` or `web/`, then `python3 mcp/inline.py` (reg
 
 ## License and attribution
 Immich is © Immich contributors, [AGPL-3.0](https://github.com/immich-app/immich/blob/main/LICENSE); used unmodified from its official images. immich-go is © simulot and contributors, AGPL-3.0, downloaded unmodified. This packaging is AGPL-3.0-only (`LICENSE`). The shared Wizard UI kit files in `web/` (`wizard-*.css`, `boot.js`, `wizard-sheet.js`, `standalone*.css`) come from humanitylabs-org/wizard-os under GPL-3.0 (`LICENSE-GPL-3.0-kit`, `appearance-provenance.json`). Immich is not affiliated with this package. Not affiliated with Google.
+
+## Phone backup from Wizard OS for Android
+
+The Phone backup sheet (web/photos.js, tests/photos.test.cjs) is the former view-only Photos app
+(humanitylabs-org/wizard-photos-app, by Archimedes for James), merged here so there is one Photos app. The backup
+worker stays in Wizard OS for Android (`ai.wizards.os.photos`); this page drives it through the shell's
+`wizard-os:photos` relay and hands it this app's own Immich address, so the owner never types a server. In a browser
+or the desktop shell there is no relay and the button stays hidden.

@@ -61,6 +61,7 @@ function render(s) {
   }
   const phone = s.links && s.links.mobile_server_url;
   el('phone-line').textContent = phone ? 'Phone backup: install the Immich app, type ' + phone + ' as the server, tap Next, then Continue. Keep Tailscale on.' : '';
+  if (phone) backup.server = phone;
   el('agent-line').textContent = s.agent_connected ? 'Your agent is connected to Photos.' : 'Your agent connects by itself once Photos has finished setting up.';
 }
 
@@ -114,9 +115,59 @@ el('import-go').onclick = async () => {
 if (!window.WizardApp || WizardApp.version !== 1) {
   say('Wizard system functions are unavailable. Open Photos through Wizard.', 'error');
 } else {
-  WizardApp.ready({ name: 'Photos', version: '0.2.0' });
+  WizardApp.ready({ name: 'Photos', version: '0.3.0' });
   WizardApp.back.register({ canGoBack: () => false, back: () => false });
 }
 
 refresh();
 setInterval(() => { if (!document.hidden) refresh(); }, 15000);
+
+// ---- Phone backup (from the Wizard OS Android app) ----
+// The backup worker lives in Wizard OS for Android; this page drives it through the shell's Photos relay
+// (photos.js, unchanged from the former view-only Photos app). The photo server is this app's own Immich, so the
+// owner never types an address. In a browser or the desktop shell there is no relay and the button stays hidden.
+const backup = { mode: '', status: null, error: '', busy: false, server: '', albumsOpen: false, albums: null, albumsError: '', confirmDisconnect: false };
+const P = window.PhotosPage;
+const framed = window.parent && window.parent !== window;
+const bapi = P.client(msg => {
+  if (!framed) throw Object.assign(new Error('no-bridge'), { code: 'no-bridge' });
+  window.parent.postMessage(msg, location.origin);
+}, {
+  onStatus: s => { backup.status = s; if (backup.mode !== 'v1') { backup.mode = 'v1'; el('open-backup').hidden = false; } renderBackup(); },
+  onResume: () => { if (backup.mode === 'v1') bapi.status().catch(() => {}); },
+});
+window.addEventListener('message', ev => { if (ev.origin === location.origin && ev.source === window.parent) bapi.onMessage(ev.data); });
+
+function renderBackup() {
+  const root = el('backup-root');
+  if (document.activeElement && document.activeElement.matches && document.activeElement.matches('[data-ph-server]')) {
+    root.querySelectorAll('[data-ph-status]').forEach(x => { x.textContent = backup.error || P.summary(backup.status); }); return;
+  }
+  root.innerHTML = backup.mode === 'v1' ? P.html(backup) : '<p class="ph-status">Checking…</p>';
+  if (backup.status) el('open-backup').textContent = backup.status.enabled ? 'Phone backup · on' : 'Phone backup';
+}
+function backupTap(what, extra = {}) {
+  backup.error = '';
+  const pending = P.act(backup, bapi, what, extra);
+  if (!pending) { renderBackup(); return; }
+  if (what !== 'albums' && what !== 'album') backup.busy = what === 'run' ? 'run' : true;
+  renderBackup();
+  pending.catch(e => { backup.error = e.timeout ? 'The Wizard OS app did not answer · try again' : e.message; })
+    .finally(() => { backup.busy = false; renderBackup(); });
+}
+el('backup-root').addEventListener('click', e => {
+  const b = e.target.closest('[data-ph], [data-ph-album]'); if (!b || b.disabled) return;
+  if (b.dataset.phAlbum != null) { backupTap('album', { id: b.dataset.phAlbum }); return; }
+  const field = el('backup-root').querySelector('[data-ph-server]');
+  backupTap(b.dataset.ph, field && field.value ? { server: field.value } : {});
+});
+el('backup-root').addEventListener('input', e => { if (e.target.matches('[data-ph-server]')) backup.server = e.target.value; });
+el('open-backup').onclick = () => { WzSheet.open(el('backup-sheet')); renderBackup(); bapi.status().catch(() => {}); };
+el('backup-sheet').addEventListener('close', () => { backup.albumsOpen = false; backup.confirmDisconnect = false; });
+P.detect(bapi).then(mode => {
+  if (mode !== 'v1' && mode !== 'v1-error') return; // browser, desktop or an old phone app: Immich phone app instructions stay in Agent
+  backup.mode = 'v1';
+  if (mode === 'v1-error') backup.error = 'Could not read backup status · try again';
+  el('open-backup').hidden = false;
+  renderBackup();
+});

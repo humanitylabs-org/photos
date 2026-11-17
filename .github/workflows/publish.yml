@@ -8,6 +8,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Phone backup page tests
+        run: node --test tests/photos.test.cjs
       - name: Front tests
         run: python3 -m unittest discover -s tests -v
       - name: Generated MCP front is up to date

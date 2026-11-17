@@ -15,7 +15,7 @@ root = Path(__file__).resolve().parent.parent
 compose = root / "runtipi" / "docker-compose.yml"
 single = root / "app" / "front.py"
 WEB = ["index.html", "app.js", "styles.css", "boot.js", "wizard-tokens.css", "wizard-ui.css", "standalone.css",
-       "standalone-tokens.css", "wizard-sheet.js"]
+       "standalone-tokens.css", "wizard-sheet.js", "photos.js"]
 src = (root / "mcp" / "front.py").read_text() + "\n\n# ---- tools for this app ----\n" + (root / "mcp" / "tools.py").read_text()
 # The page ships base64-wrapped so a dollar sign in CSS/JS never reaches compose interpolation.
 vendor = {name: base64.b64encode((root / "web" / name).read_bytes()).decode() for name in WEB}

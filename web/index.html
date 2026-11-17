@@ -12,6 +12,7 @@
   <link rel="stylesheet" href="styles.css">
   <script defer src="/wizard-os-home/core/app-client.js"></script>
   <script defer src="wizard-sheet.js"></script>
+  <script defer src="photos.js"></script>
   <script defer src="app.js"></script>
 </head>
 <body>
@@ -20,6 +21,7 @@
       <h1>Photos</h1>
       <p id="line">Loading…</p>
       <nav class="ph-actions" aria-label="Photos actions">
+        <button id="open-backup" class="wz-chip" type="button" hidden>Phone backup</button>
         <button id="open-import" class="wz-chip" type="button">Import from Google</button>
         <button id="open-agent" class="wz-chip" type="button">Agent</button>
         <a id="open-full" class="wz-chip" target="_blank" rel="noopener" hidden>Open full screen ↗</a>
@@ -31,6 +33,11 @@
     </div>
     <p id="status" class="wz-status" role="status" aria-live="polite"></p>
   </div>
+
+  <dialog id="backup-sheet" class="wz-sheet" aria-labelledby="backup-h">
+    <h2 id="backup-h">Back up this phone</h2>
+    <div id="backup-root" aria-live="polite"></div>
+  </dialog>
 
   <dialog id="import-sheet" class="wz-sheet" aria-labelledby="import-h">
     <h2 id="import-h">Import from Google Photos</h2>

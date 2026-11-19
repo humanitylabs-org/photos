@@ -4,9 +4,29 @@
 .ph-head p { margin: 2px 0 8px; }
 .ph-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .ph-actions a.wz-chip { text-decoration: none; }
+.ph-actions [hidden], .ph-menu [hidden] { display: none; } /* .wz-chip's display would otherwise beat [hidden] */
 .ph-setup { margin: var(--wz-space-2) var(--wz-space-3); }
 .ph-setup h2 { margin: 0 0 6px; }
 .ph-frame-wrap { flex: 1; min-height: 0; margin: 8px 0 0; border-top: 1px solid var(--wz-border); }
+/* Phone and other narrow widths: no Photos header over Immich's own top bar. Immich fills the app area under the
+ * shell's cutout; the actions live behind one quiet ⋯ button (in the gap between Immich's logo and its search
+ * button) that opens the menu sheet. Wide layouts keep the header. */
+.ph-app { position: relative; }
+.ph-more { display: none; }
+.ph-menu a.wz-row { text-decoration: none; color: inherit; }
+@container wz-app (max-width: 599px) {
+  .ph-head { display: none; }
+  .ph-frame-wrap { margin: 0; border-top: 0; padding-top: var(--wos-cutout, 0px); }
+  .ph-setup { margin-top: calc(var(--wos-cutout, 0px) + 60px); }
+  .ph-more { display: grid; place-items: center; position: absolute; z-index: 2; top: calc(var(--wos-cutout, 0px) + 10px); left: 110px;
+    width: var(--wz-target, 44px); height: var(--wz-target, 44px); padding: 0; border: 0; border-radius: 50%; background: none;
+    color: var(--ink-3, currentColor); opacity: .75; -webkit-tap-highlight-color: transparent; }
+  .ph-more::before { content: ""; position: absolute; inset: 7px; border-radius: 50%; background: color-mix(in srgb, var(--wz-base, #000) 35%, transparent); }
+  .ph-more svg { position: relative; width: 20px; height: 20px; fill: currentColor; }
+  .ph-more:active, .ph-more:focus-visible { opacity: 1; }
+  /* No library yet (setup cards): the button sits top right, above the card. */
+  .ph-app:has(#frame-wrap[hidden]) .ph-more { left: auto; right: 8px; }
+}
 .ph-frame-wrap iframe { display: block; width: 100%; height: 100%; border: 0; background: var(--wz-canvas); }
 .ph-steps { margin: 0 0 12px; padding-left: 1.2em; line-height: 1.45; }
 .ph-steps li { margin: 0 0 6px; }

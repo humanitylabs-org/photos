@@ -43,6 +43,7 @@ function render(s) {
   if (busy) line += ' · organising ' + n(busy);
   if (s.import && s.import.state === 'running') line += ' · importing';
   el('line').textContent = line;
+  el('menu-line').textContent = line;
 
   el('setup').hidden = true;
   if (!own) {
@@ -106,6 +107,22 @@ el('open-import').onclick = async () => {
   try { renderImport(await request('api/import')); } catch (e) { say(e.message, 'error'); }
 };
 el('open-agent').onclick = () => WzSheet.open(el('agent-sheet'));
+
+// The ⋯ menu (narrow widths, where the header is hidden): the same actions as the header chips, in one sheet.
+function syncMenu() {
+  for (const row of el('menu-sheet').querySelectorAll('[data-menu]')) {
+    const chip = el(row.dataset.menu);
+    row.parentElement.hidden = chip.hidden;
+    row.querySelector('b').textContent = chip.textContent;
+    if (chip.href) row.href = chip.href;
+  }
+}
+el('open-menu').onclick = () => { syncMenu(); WzSheet.open(el('menu-sheet')); };
+el('menu-sheet').addEventListener('click', e => {
+  const row = e.target.closest('[data-menu]'); if (!row) return;
+  WzSheet.close(el('menu-sheet'));
+  if (row.dataset.menu !== 'open-full') el(row.dataset.menu).click(); // the link opens by itself
+});
 el('import-go').onclick = async () => {
   el('import-go').disabled = true;
   try { const r = await request('api/import/start', {}); say(r.started ? 'Import started.' : (r.message || 'Not started.'), 'note'); }

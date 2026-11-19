@@ -177,6 +177,22 @@ class Front(unittest.TestCase):
         st = os.stat(os.path.join(self.m.STATE, "owner.json"))
         self.assertEqual(st.st_mode & 0o777, 0o600)
 
+    def test_phone_layout_has_no_header_over_immich(self):
+        # photos#3: under 600 px the Photos header is hidden and the actions sit behind one ⋯ button and sheet.
+        html = (ROOT / "web" / "index.html").read_text()
+        css = (ROOT / "web" / "styles.css").read_text()
+        js = (ROOT / "web" / "app.js").read_text()
+        self.assertIn('id="open-menu"', html)
+        self.assertIn('aria-label="Photos menu"', html)
+        self.assertIn('<dialog id="menu-sheet" class="wz-sheet"', html)
+        for action in ("open-backup", "open-import", "open-agent", "open-full"):
+            self.assertIn(f'data-menu="{action}"', html)
+        narrow = css.split("@container wz-app (max-width: 599px) {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn(".ph-head { display: none; }", narrow)
+        self.assertIn("border-top: 0", narrow)
+        self.assertIn("var(--wz-target, 44px)", narrow)
+        self.assertIn("WzSheet.open(el('menu-sheet'))", js)
+
     def test_page_served_with_csp(self):
         out = self.m.page_route("GET", "/photos/", "", {"host": "box.ts.net:8444"}, b"")
         self.assertEqual(out[0], 200)

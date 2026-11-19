@@ -27,12 +27,24 @@
         <a id="open-full" class="wz-chip" target="_blank" rel="noopener" hidden>Open full screen ↗</a>
       </nav>
     </header>
+    <button id="open-menu" class="ph-more" type="button" aria-label="Photos menu" aria-haspopup="dialog" aria-controls="menu-sheet"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/></svg></button>
     <section id="setup" class="wz-card ph-setup" hidden></section>
     <div id="frame-wrap" class="ph-frame-wrap" hidden>
       <iframe id="immich" title="Immich" allow="fullscreen; clipboard-read; clipboard-write" referrerpolicy="same-origin"></iframe>
     </div>
     <p id="status" class="wz-status" role="status" aria-live="polite"></p>
   </div>
+
+  <dialog id="menu-sheet" class="wz-sheet" aria-labelledby="menu-h">
+    <h2 id="menu-h">Photos</h2>
+    <p id="menu-line" class="ph-help"></p>
+    <ul class="wz-list ph-menu" aria-label="Photos actions">
+      <li hidden><button class="wz-row" type="button" data-menu="open-backup"><span class="wz-main"><b>Phone backup</b></span></button></li>
+      <li><button class="wz-row" type="button" data-menu="open-import"><span class="wz-main"><b>Import from Google</b></span></button></li>
+      <li><button class="wz-row" type="button" data-menu="open-agent"><span class="wz-main"><b>Agent</b></span></button></li>
+      <li hidden><a class="wz-row" data-menu="open-full" target="_blank" rel="noopener"><span class="wz-main"><b>Open full screen ↗</b></span></a></li>
+    </ul>
+  </dialog>
 
   <dialog id="backup-sheet" class="wz-sheet" aria-labelledby="backup-h">
     <h2 id="backup-h">Back up this phone</h2>

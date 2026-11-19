@@ -21,7 +21,7 @@
   .ph-more { display: grid; place-items: center; position: absolute; z-index: 2; top: calc(var(--wos-cutout, 0px) + 10px); left: 110px;
     width: var(--wz-target, 44px); height: var(--wz-target, 44px); padding: 0; border: 0; border-radius: 50%; background: none;
     color: var(--ink-3, currentColor); opacity: .75; -webkit-tap-highlight-color: transparent; }
-  .ph-more::before { content: ""; position: absolute; inset: 7px; border-radius: 50%; background: color-mix(in srgb, var(--wz-base, #000) 35%, transparent); }
+  .ph-more::before { content: ""; position: absolute; inset: 7px; border-radius: 50%; background: color-mix(in srgb, var(--wz-base) 35%, transparent); }
   .ph-more svg { position: relative; width: 20px; height: 20px; fill: currentColor; }
   .ph-more:active, .ph-more:focus-visible { opacity: 1; }
   /* No library yet (setup cards): the button sits top right, above the card. */

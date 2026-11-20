@@ -27,7 +27,7 @@ The app's port is served only on the owner's tailnet, so reaching it is the acce
 - An Immich that already has an account the front did not create is left alone (status explains); reinstall with data removed to start fresh.
 
 ## Agent tools (MCP, box-only)
-`photos_status`, `photos_people`, `photos_search`, `photos_move_to_trash` (preview, then confirmed with the exact count; Immich trash only, never `force`), `photos_restore_from_trash`, `photos_import_status`, `photos_import_start`. See [SKILL.md](SKILL.md).
+`photos_status`, `photos_people`, `photos_search`, `photos_move_to_trash` (preview, then confirmed with the exact count; Immich trash only, never `force`), `photos_restore_from_trash`, `photos_review_album` and `photos_trash_album` (review albums, behind the off-by-default switch `review-albums`), `photos_import_status`, `photos_import_start`. See [SKILL.md](SKILL.md).
 
 ## Develop
 Edit `mcp/front.py`, `mcp/tools.py` or `web/`, then `python3 mcp/inline.py` (regenerates the compose `command` and `app/front.py`), `python3 -m unittest discover -s tests`, `wam verify .`.

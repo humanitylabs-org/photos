@@ -25,15 +25,18 @@ MAX_HEAD = 65536
 STRIP_FORWARDED = tuple(h.strip().lower() + ":" for h in os.environ.get("STRIP_FORWARDED", "").split(",") if h.strip())
 MAX_BODY = 1 << 20
 TOOLS = {}
+TOOL_SWITCH = {}  # tool name -> app switch id: the tool is listed and callable only while that switch is on
 ROUTES = {}  # path prefix -> fn(method, path, query, headers, body) -> (status, content_type, bytes); app pages and APIs
 ROUTE_MATCH = {}  # path prefix -> fn(path) -> bool: a route can leave some paths under its prefix to the engine
 REQUEST = contextvars.ContextVar("request", default={})  # headers of the current /mcp call
 
 
-def tool(name, description, props=None, required=()):
+def tool(name, description, props=None, required=(), switch=None):
     def deco(fn):
         schema = {"type": "object", "properties": props or {}, "required": list(required)}
         TOOLS[name] = ({"name": name, "description": description, "inputSchema": schema}, fn)
+        if switch:
+            TOOL_SWITCH[name] = switch
         return fn
     return deco
 
@@ -93,16 +96,27 @@ def err(i, code, message):
     return {"jsonrpc": "2.0", "id": i, "error": {"code": code, "message": message}}
 
 
+def tool_enabled(name):
+    sw = TOOL_SWITCH.get(name)
+    if not sw:
+        return True
+    on = globals().get("switch_on")  # the app's switches (wizard.app-switches/1), defined with its tools
+    try:
+        return bool(on and on(sw))
+    except Exception:
+        return False
+
+
 def rpc(msg):
     m, i, p = msg.get("method"), msg.get("id"), msg.get("params") or {}
     if m == "initialize":
         r = {"protocolVersion": p.get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}},
              "serverInfo": {"name": APP, "version": VERSION}}
     elif m == "tools/list":
-        r = {"tools": [t[0] for t in TOOLS.values()]}
+        r = {"tools": [t[0] for n, t in TOOLS.items() if tool_enabled(n)]}
     elif m == "tools/call":
         name, args = p.get("name"), p.get("arguments") or {}
-        if name not in TOOLS:
+        if name not in TOOLS or not tool_enabled(name):
             return err(i, -32602, "unknown tool %s" % name)
         try:
             out = TOOLS[name][1](**args)

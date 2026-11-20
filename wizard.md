@@ -5,7 +5,7 @@ name: Photos
 type: view
 category: app
 tags: [photos]
-version: 0.3.1
+version: 0.4.0
 summary: Your own Google Photos on your Wizard (Immich). Import from Google Takeout, group faces, clean up, back up your phone.
 icon: icon.png
 license: AGPL-3.0-only

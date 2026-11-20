@@ -132,7 +132,7 @@ el('import-go').onclick = async () => {
 if (!window.WizardApp || WizardApp.version !== 1) {
   say('Wizard system functions are unavailable. Open Photos through Wizard.', 'error');
 } else {
-  WizardApp.ready({ name: 'Photos', version: '0.4.0' });
+  WizardApp.ready({ name: 'Photos', version: '0.4.1' });
   WizardApp.back.register({ canGoBack: () => false, back: () => false });
 }
 

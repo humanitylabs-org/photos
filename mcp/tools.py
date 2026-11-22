@@ -33,7 +33,7 @@ KEY_NAME = "Wizard agent (Photos app)"
 # What the agent tools and immich-go need (immich-go docs/installation.md "API Permissions"), nothing more.
 KEY_PERMISSIONS = [
     "asset.read", "asset.statistics", "asset.update", "asset.upload", "asset.copy", "asset.delete", "asset.download",
-    "asset.view", "album.create", "album.read", "album.delete", "albumAsset.create", "albumAsset.delete", "server.about", "server.statistics",
+    "asset.view", "album.create", "album.read", "albumAsset.create", "server.about", "server.statistics",
     "server.storage", "stack.create", "tag.asset", "tag.create", "tag.read", "user.read", "job.create", "job.read",
     "person.read", "person.statistics", "timeline.read",
 ]
@@ -378,140 +378,6 @@ def restore_from_trash(asset_ids=None, everything=False):
     return {"restored": n}
 
 
-# ---------------- review albums (switch "review-albums", humanitylabs-org/photos#6) ----------------
-# The agent fills an album with its picks; the owner scrolls it in Immich and removes what he keeps; "trash the rest"
-# trashes exactly what is still in it (same count-and-confirm as move_to_trash), then the album goes. Only albums
-# this tool made (review-albums.json) can be trashed this way, never the owner's own albums.
-
-REVIEW_PREFIX = "Cleanup \u00b7 "
-REVIEW_CAP = 10000
-
-
-def _review_on():
-    if not switch_on("review-albums"):
-        raise RuntimeError("Review albums are switched off on this Wizard (Photos switch review-albums).")
-
-
-def _review_name(name):
-    name = " ".join(str(name or "").split())[:120]
-    if name.startswith(REVIEW_PREFIX):
-        name = name[len(REVIEW_PREFIX):].strip()
-    if not name:
-        raise ValueError("Give the album a short name, e.g. 'Screenshots' (it becomes 'Cleanup \u00b7 Screenshots').")
-    return REVIEW_PREFIX + name
-
-
-def _review_albums():
-    return {k: v for k, v in (_read_json("review-albums.json", {}) or {}).items() if UUID_RE.match(k)}
-
-
-def _album_ids(album_id):
-    return _matching_ids({"albumIds": [album_id]}, cap=REVIEW_CAP * 5)
-
-
-def _find_review_album(album_id="", name=""):
-    mine = _review_albums()
-    if album_id:
-        if not UUID_RE.match(str(album_id)):
-            raise ValueError("album_id must be an Immich album id")
-        if album_id not in mine:
-            raise ValueError("That album was not made by photos_review_album, so it is not trashed this way. "
-                             "Use photos_move_to_trash with asset_ids instead.")
-        return album_id
-    full = _review_name(name)
-    hits = [a for a in _api("GET", "/albums") or [] if a.get("albumName") == full and a.get("id") in mine]
-    if not hits:
-        return None
-    return hits[0]["id"]
-
-
-def review_album(name, asset_ids=None, query="", person="", taken_after="", taken_before="", media_type="", city="",
-                 favorite=None, limit=1000):
-    _review_on()
-    full = _review_name(name)
-    asset_ids = [str(x) for x in (asset_ids or [])]
-    bad = [x for x in asset_ids if not UUID_RE.match(x)]
-    if bad:
-        raise ValueError("not Immich asset ids: %s" % ", ".join(bad[:5]))
-    has_filter = bool(query or person or taken_after or taken_before or media_type or city or favorite is not None)
-    if asset_ids and has_filter:
-        raise ValueError("Give either asset_ids or a search (query/filters), not both.")
-    if asset_ids:
-        ids = list(dict.fromkeys(asset_ids))
-    elif query:
-        f = _filters(person, taken_after, taken_before, media_type, city, favorite)
-        size = max(1, min(int(limit or 1000), 1000))
-        body = _api("POST", "/search/smart", dict(f, query=str(query)[:500], size=size), timeout=120)
-        ids = [a["id"] for a in (body.get("assets") or {}).get("items") or []]
-    elif has_filter:
-        ids = _matching_ids(_filters(person, taken_after, taken_before, media_type, city, favorite), cap=REVIEW_CAP + 1)
-    else:
-        raise ValueError("Say which photos: asset_ids, or a search (query and/or person, dates, type, city, favourite).")
-    if len(ids) > REVIEW_CAP:
-        raise ValueError("That is more than %d photos; narrow it (e.g. by dates) and fill the album in parts." %
-                         REVIEW_CAP)
-    if not ids:
-        return {"album": full, "added": 0, "note": "Nothing matched, so no album was made or changed."}
-    album_id = _find_review_album(name=full)
-    created = album_id is None
-    if created:
-        made = _api("POST", "/albums", {"albumName": full, "description": "Made by your Wizard agent for review. "
-                    "Remove the photos you want to keep; the agent trashes what is left only when you say so."})
-        album_id = made["id"]
-        mine = _review_albums()
-        mine[album_id] = {"name": full, "created_at": int(time.time())}
-        _write_json("review-albums.json", mine)
-    added = 0
-    for i in range(0, len(ids), 500):
-        res = _api("PUT", "/albums/%s/assets" % album_id, {"ids": ids[i:i + 500]}, timeout=300)
-        added += sum(1 for r in res or [] if r.get("success"))
-    total = len(_album_ids(album_id))
-    own = _own_url()
-    return {"album": full, "album_id": album_id, "created": created, "added": added,
-            "already_in_album": len(ids) - added, "in_album_now": total,
-            **({"open": "%s/albums/%s" % (own, album_id)} if own else {}),
-            "next": "Tell the owner the album '%s' has %d photos. He scrolls it in Immich (Albums) on his phone and "
-                    "removes the ones he wants to keep (select, then Remove from album; that never deletes them). "
-                    "When he says to trash the rest, call photos_trash_album." % (full, total)}
-
-
-def trash_album(album_id="", name="", expected_count=None, confirmed=False):
-    _review_on()
-    if not (album_id or name):
-        raise ValueError("Give the review album's album_id or name.")
-    album_id = _find_review_album(album_id, name)
-    if not album_id:
-        raise ValueError("No review album called %r. photos_review_album makes one." % _review_name(name))
-    ids = _album_ids(album_id)
-    count = len(ids)
-    trash_days = (_immich("GET", "/server/config", timeout=5)[1] or {}).get("trashDays", 30)
-    full = _review_albums().get(album_id, {}).get("name")
-    if not confirmed:
-        sample = []
-        if count:
-            body = _api("POST", "/search/metadata", {"albumIds": [album_id], "size": 5, "withExif": True,
-                                                     "withPeople": True})
-            sample = [_asset_row(a, _own_url()) for a in (body.get("assets") or {}).get("items") or []]
-        return {"preview": True, "album": full, "would_move_to_trash": count, "sample": sample,
-                "next": "Tell the owner exactly how many photos/videos are still in '%s' and get his yes. Then call "
-                        "again with confirmed=true and expected_count=%d. They go to Immich's trash (kept %s days, "
-                        "restorable) and the album is removed." % (full, count, trash_days)}
-    if expected_count is None or int(expected_count) != count:
-        raise ValueError("The album now holds %d items, not %s. Preview again and re-confirm with the owner." %
-                         (count, expected_count))
-    moved = 0
-    for i in range(0, len(ids), 500):
-        _api("DELETE", "/assets", {"ids": ids[i:i + 500], "force": False}, timeout=300)
-        moved += len(ids[i:i + 500])
-    _api("DELETE", "/albums/%s" % album_id)
-    mine = _review_albums()
-    mine.pop(album_id, None)
-    _write_json("review-albums.json", mine)
-    return {"moved_to_trash": moved, "album_removed": full, "restorable_for_days": trash_days,
-            "undo": "photos_restore_from_trash with these asset ids, or Immich > Trash > Restore.",
-            "asset_ids": ids if len(ids) <= 500 else None}
-
-
 # ---------------- Google Takeout import (immich-go) ----------------
 
 def _zips():
@@ -728,7 +594,7 @@ def _ensure_agent_key(force=False):
         tok = AUTH.get("token")
         if old.get("secret") and not force:
             c, _ = _immich("GET", "/users/me", key=old["secret"], timeout=10)
-            # A key made before a scope was added (e.g. the review albums' album.delete) is remade once.
+            # A key whose stored scopes differ from KEY_PERMISSIONS (a scope added or dropped) is remade once.
             upgrade = c == 200 and tok and sorted(old.get("permissions") or []) != sorted(KEY_PERMISSIONS)
             if c != 401 and not upgrade:
                 return c == 200
@@ -1059,35 +925,6 @@ def photos_restore_from_trash(asset_ids=None, everything=False):
     return restore_from_trash(asset_ids, everything)
 
 
-@tool("photos_review_album", "Put a set of photos into an Immich review album named 'Cleanup \u00b7 <name>' (made if "
-      "missing, otherwise added to) so the owner can scroll it on his phone and remove the ones he keeps. Pick them "
-      "by asset_ids, or by a search like photos_search (query and/or person, dates, type, city, favourite). Nothing "
-      "is trashed; when the owner says to trash the rest, use photos_trash_album.",
-      {"name": {"type": "string", "description": "Short album name, e.g. 'Screenshots'"},
-       "asset_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 10000},
-       "query": {"type": "string", "description": "Meaning-based search, best matches first (up to limit)"},
-       "person": {"type": "string"}, "taken_after": {"type": "string", "description": "YYYY-MM-DD"},
-       "taken_before": {"type": "string", "description": "YYYY-MM-DD"},
-       "media_type": {"type": "string", "enum": ["IMAGE", "VIDEO"]}, "city": {"type": "string"},
-       "favorite": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}},
-      required=("name",), switch="review-albums")
-def photos_review_album(name="", asset_ids=None, query="", person="", taken_after="", taken_before="", media_type="",
-                        city="", favorite=None, limit=1000):
-    _box_only()
-    return review_album(name, asset_ids, query, person, taken_after, taken_before, media_type, city, favorite, limit)
-
-
-@tool("photos_trash_album", "Trash the rest of a review album: moves exactly the photos still in it to Immich's TRASH "
-      "(restorable, never a permanent delete), then removes the album. Only albums made by photos_review_album. First "
-      "call without confirmed returns the count and a sample; tell the owner the count, get his yes, then call again "
-      "with confirmed=true and expected_count equal to that count.",
-      {"album_id": {"type": "string"}, "name": {"type": "string", "description": "The review album's name"},
-       "expected_count": {"type": "integer"}, "confirmed": {"type": "boolean"}}, switch="review-albums")
-def photos_trash_album(album_id="", name="", expected_count=None, confirmed=False):
-    _box_only()
-    return trash_album(album_id, name, expected_count, confirmed)
-
-
 @tool("photos_import_status", "Google Takeout import: Takeout files waiting in Files > Photos > Import, whether an "
       "import is running, done or failed, its options and the last log lines.")
 def photos_import_status():
@@ -1144,13 +981,7 @@ def _body(headers, body):
 # ({"id", "name", "description", "default": False, "issues": ["humanitylabs-org/photos#N"]}) and gate it on
 # switch_on(id). Kept on the box (STATE_DIR/switches.json). Owner only: the box's Tailscale Serve login with
 # X-Wizard-Switch: 1; never a bearer or a box-local host.
-SWITCHES = [
-    {"id": "review-albums", "name": "Review albums for cleanup",
-     "description": "The agent can put the photos it thinks are junk (screenshots, receipts, memes) into an Immich "
-                    "album such as \"Cleanup \u00b7 Screenshots\". Scroll it on your phone, remove the ones you keep, "
-                    "then tell the agent to trash the rest. Albums never trash anything on their own.",
-     "default": False, "issues": ["humanitylabs-org/photos#6"]},
-]
+SWITCHES = []
 _SW_LOCAL = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
 
 
@@ -1203,6 +1034,22 @@ def switches_route(method, headers, body):
     saved[d["id"]] = d["on"]
     _write_json("switches.json", saved)
     return _json(200, switches_doc())
+
+
+def _drop_removed_switch_state():
+    # Review albums (switch review-albums, humanitylabs-org/photos#6) were dropped (#14): forget their stored values.
+    # Albums already made in Immich are the owner's photos and stay as they are.
+    try:
+        os.remove(_state_path("review-albums.json"))
+    except OSError:
+        pass
+    saved = _read_json("switches.json", None)
+    if isinstance(saved, dict) and "review-albums" in saved:
+        saved.pop("review-albums")
+        _write_json("switches.json", saved)
+
+
+STARTUP.append(_drop_removed_switch_state)
 
 
 @route("/api/switches", match=lambda p: p.rstrip("/") == "/api/switches")

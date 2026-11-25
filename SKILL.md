@@ -29,6 +29,10 @@ New camera-roll photos (taken at most 3 days before they arrived, never a Takeou
 
 Permanent deletion is the owner's own act in Immich: Trash › Empty trash (or wait 30 days). Never claim a photo is gone for good after `photos_move_to_trash`.
 
+## Monthly print review (only while the app switch print-review is on)
+- `photos_print_review(month="YYYY-MM")` (default last month, read only): the photos the owner approved to print for that month and his note (`approved_by_owner: true`), or Photos' suggested shortlist when he has not saved one yet. The owner picks and saves in **Photos › Print review**.
+- Never order, mail, buy or pay for prints, and never say a set was ordered: Photos has no way to do that. Printing is a separate step the owner takes himself; ask him first.
+
 ## No sign-in (Tailscale is the lock)
 The owner never makes an account or types a password; never ask him for one or offer to "set up a login". On first start Photos creates Immich's one account itself (placeholder email `owner@photos.wizard`, random password kept only in the app's private state volume as `owner.json`; never read, print or share it), marks Immich's first-run tour done, and connects the agent with a narrow API key. Every visit from his tailnet arrives signed in: the Wizard screen (`?open=photos`), Immich full screen (`links.immich`) and the phone app. A different tailnet user than the owner, or a cross-site write from a web page, meets Immich's normal sign-in instead.
 

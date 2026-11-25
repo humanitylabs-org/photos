@@ -39,6 +39,16 @@ and copies document photos into Files with the Service's `wizard_capture`. Origi
 batch on the Service, Photos takes away exactly the tags, album additions and albums it made. While on, the agent key
 also has `albumAsset.delete` and `album.delete` for that undo. Switch off (or no token): nothing changes.
 
+## Monthly print review (app switch `print-review`, off by default)
+humanitylabs-org/photos#2. With the switch on, Photos has a **Print review** entry (header chip, or the ⋯ menu on a
+phone). It opens last month (‹ › for other months): Photos suggests 8 photos out of up to 24 candidates from that month
+(images only, no screenshots or saved PNGs; favourites, 4-5 star ratings and photos with named people first; spread over
+different days and never two from the same two-minute burst). The owner taps photos out or in (up to 30), writes a
+short note (280 characters) and saves the approved set; it is kept per month on the box (`/state/print-review.json`).
+An empty library shows how to fill it (phone backup or Import from Google). The agent can read a month's set with
+`photos_print_review`. Nothing in Photos orders, mails or pays for prints: that stays a separate step the owner takes.
+Switch off: no entry, the routes answer 404, no tool, and a saved file is left as it is.
+
 ## Develop
 Edit `mcp/front.py`, `mcp/tools.py` or `web/`, then `python3 mcp/inline.py` (regenerates the compose `command` and `app/front.py`), `python3 -m unittest discover -s tests`, `wam verify .`.
 

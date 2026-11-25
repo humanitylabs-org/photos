@@ -53,6 +53,7 @@ function render(s) {
   } else if (!(s.sign_in && s.sign_in.ready)) {
     setupCard('Photos is setting up', (s.sign_in && s.sign_in.problem) || 'Photos makes its own library for you; there is nothing to sign in to. This page refreshes on its own.');
   }
+  el('open-prints').hidden = !s.print_review;
   el('open-full').hidden = !own;
   if (own) el('open-full').href = own;
   const frame = el('immich');
@@ -129,6 +130,86 @@ el('import-go').onclick = async () => {
   catch (e) { say(e.message, 'error'); }
   try { renderImport(await request('api/import')); } catch (e) {}
 };
+// ---- Monthly print review (app switch print-review, humanitylabs-org/photos#2) ----
+// Photos suggests a few photos of last month; the owner takes photos out or puts others in, writes a note and saves
+// the approved set on the box. Nothing here orders, mails or pays for prints.
+const prints = { month: '', doc: null, picked: new Set(), busy: false };
+function monthShift(month, by) {
+  const [y, m] = month.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m - 1 + by, 1));
+  return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0');
+}
+function renderPrints() {
+  const d = prints.doc; if (!d) return;
+  el('print-month').textContent = d.label;
+  el('print-next').disabled = prints.busy || d.month >= monthShift(d.previous_month, 1);
+  el('print-prev').disabled = prints.busy;
+  el('print-line').textContent = d.next || '';
+  el('print-never').textContent = d.never_orders || '';
+  const grid = el('print-grid'); grid.replaceChildren();
+  for (const c of d.candidates || []) {
+    const li = document.createElement('li');
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'ph-print-pick';
+    const on = prints.picked.has(c.id);
+    b.setAttribute('aria-pressed', String(on));
+    const when = c.taken ? new Date(c.taken.slice(0, 10) + 'T12:00:00Z').toLocaleDateString(undefined, { day: 'numeric', month: 'short', timeZone: 'UTC' }) : '';
+    b.setAttribute('aria-label', (on ? 'Picked: ' : 'Not picked: ') + [when, (c.people || []).join(', ')].filter(Boolean).join(', '));
+    const img = document.createElement('img'); img.alt = ''; img.loading = 'lazy'; img.decoding = 'async';
+    img.src = 'api/print-review/thumb?id=' + encodeURIComponent(c.id);
+    const mark = document.createElement('span'); mark.className = 'ph-print-mark'; mark.setAttribute('aria-hidden', 'true');
+    mark.innerHTML = '<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+    const cap = document.createElement('span'); cap.className = 'ph-print-cap'; cap.textContent = when;
+    b.append(img, mark, cap);
+    b.onclick = () => {
+      if (prints.picked.has(c.id)) prints.picked.delete(c.id);
+      else if (prints.picked.size < (d.max || 30)) prints.picked.add(c.id);
+      renderPrints();
+    };
+    li.append(b); grid.append(li);
+  }
+  const any = (d.candidates || []).length > 0;
+  el('print-form').hidden = !any;
+  el('print-count').textContent = prints.picked.size + ' of ' + d.candidates.length + ' picked' + (d.saved ? ' · saved set' : ' · not saved yet');
+  el('print-save').disabled = prints.busy || !prints.picked.size;
+  el('print-save').textContent = d.saved ? 'Save changes' : 'Save approved set';
+  const saved = el('print-saved'); saved.replaceChildren();
+  for (const s of d.saved_months || []) {
+    const li = document.createElement('li');
+    const row = document.createElement('button'); row.type = 'button'; row.className = 'wz-row';
+    const main = document.createElement('span'); main.className = 'wz-main';
+    const b = document.createElement('b'); b.textContent = s.label + ' · ' + s.count + ' photo' + (s.count === 1 ? '' : 's');
+    main.append(b);
+    if (s.note) { const sm = document.createElement('small'); sm.textContent = s.note; main.append(sm); }
+    row.append(main);
+    row.onclick = () => loadPrints(s.month);
+    li.append(row); saved.append(li);
+  }
+}
+async function loadPrints(month) {
+  prints.busy = true; if (prints.doc) renderPrints();
+  try {
+    const d = await request('api/print-review' + (month ? '?month=' + encodeURIComponent(month) : ''));
+    prints.doc = d; prints.month = d.month;
+    prints.picked = new Set((d.candidates || []).filter(c => c.selected).map(c => c.id));
+    el('print-note').value = (d.saved && d.saved.note) || '';
+  } catch (e) { say(e.message, 'error'); el('print-line').textContent = e.message; }
+  prints.busy = false; renderPrints();
+}
+el('open-prints').onclick = () => { WzSheet.open(el('print-sheet')); loadPrints(prints.month); };
+el('print-prev').onclick = () => prints.doc && loadPrints(monthShift(prints.doc.month, -1));
+el('print-next').onclick = () => prints.doc && loadPrints(monthShift(prints.doc.month, 1));
+el('print-save').onclick = async () => {
+  const d = prints.doc; if (!d || !prints.picked.size) return;
+  prints.busy = true; renderPrints();
+  const order = (d.candidates || []).map(c => c.id).filter(id => prints.picked.has(id));
+  try {
+    const r = await request('api/print-review', { month: d.month, assets: order, note: el('print-note').value });
+    prints.doc = r; prints.picked = new Set((r.candidates || []).filter(c => c.selected).map(c => c.id));
+    say('Saved ' + order.length + ' photo' + (order.length === 1 ? '' : 's') + ' for ' + r.label + '.', 'note');
+  } catch (e) { say(e.message, 'error'); el('print-line').textContent = e.message; }
+  prints.busy = false; renderPrints();
+};
+
 if (!window.WizardApp || WizardApp.version !== 1) {
   say('Wizard system functions are unavailable. Open Photos through Wizard.', 'error');
 } else {

@@ -202,6 +202,9 @@ def status(headers=None):
     out["import"] = import_summary()
     own = _own_url(headers)
     out["links"] = {"wizard": "?open=photos", **({"immich": own + "/", "mobile_server_url": own} if own else {})}
+    sw = globals().get("switch_on")
+    if sw and sw("print-review"):
+        out["print_review"] = True  # the page shows Print review (switch print-review); absent while off
     if not out["immich"]["reachable"]:
         out["next"] = "Immich is starting (the first start takes a minute or two). Try again shortly."
     elif not out["immich"]["has_owner_account"] or not out["agent_connected"]:
@@ -1347,12 +1350,251 @@ def photos_capture_file(batch, asset_id, judged_as="", rule="", tags=None, album
 # ---- end capture inbox ----
 
 
+# ---- monthly print review (app switch print-review, humanitylabs-org/photos#2) ----
+# Once a month the owner picks a few photos of last month to print (for the grandparents): Photos suggests a small
+# shortlist from that month, the owner takes photos out or puts others in, adds a short month note and saves the
+# approved set. It is kept on this box (STATE_DIR/print-review.json), per month. Photos has no ordering, mailing or
+# payment code at all: printing stays a separate step the owner takes himself. Switch off: no route, no tool, no
+# status field; a saved file stays untouched until the switch is on again.
+PRINT_SWITCH = "print-review"
+PRINT_SHORTLIST = 8     # suggested set
+PRINT_POOL = 24         # candidates shown to pick from
+PRINT_MAX = 30          # most photos in one saved set
+PRINT_NOTE_MAX = 280
+PRINT_SCAN_PAGES = 4    # up to 2,000 photos of one month are looked at
+MONTH_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])\Z")
+SCREENSHOT_RE = re.compile(r"screen[ _-]?shot|^scr_|^screen_", re.I)
+PRINT_LOCK = threading.Lock()
+NEVER_ORDERS = ("Photos never orders, mails or pays for prints. Printing is a separate step you take yourself, "
+                "with the photos you approved here.")
+PRINT_EMPTY = ("Your library is empty, so there is nothing to choose from yet. First back up your phone (Phone backup "
+               "in the Wizard OS app, or the Immich app) or bring your photos over with Import from Google.")
+
+
+def _prev_month(now=None):
+    t = time.gmtime(time.time() if now is None else now)
+    y, m = (t.tm_year, t.tm_mon - 1) if t.tm_mon > 1 else (t.tm_year - 1, 12)
+    return "%04d-%02d" % (y, m)
+
+
+def _month_range(month):
+    m = MONTH_RE.match(str(month or ""))
+    if not m:
+        raise ValueError("month is YYYY-MM, e.g. 2026-10")
+    y, mo = int(m.group(1)), int(m.group(2))
+    return ("%04d-%02d-01T00:00:00.000Z" % (y, mo),
+            "%04d-%02d-%02dT23:59:59.999Z" % (y, mo, calendar.monthrange(y, mo)[1]))
+
+
+def _month_label(month):
+    y, mo = month.split("-")
+    return "%s %s" % (calendar.month_name[int(mo)], y)
+
+
+def _print_saved():
+    d = _read_json("print-review.json", None)
+    months = d.get("months") if isinstance(d, dict) else None
+    return months if isinstance(months, dict) else {}
+
+
+def _printable(a):
+    """A photo worth printing: an image, still in the library, not a screenshot or a tiny saved picture."""
+    if a.get("type") != "IMAGE" or a.get("isTrashed") or a.get("isArchived"):
+        return False
+    if a.get("visibility") not in (None, "timeline"):
+        return False
+    name = a.get("originalFileName") or ""
+    ex = a.get("exifInfo") or {}
+    if SCREENSHOT_RE.search(name) or name.lower().endswith(".gif"):
+        return False
+    if name.lower().endswith(".png") and not (ex.get("make") or ex.get("model")):
+        return False  # a saved image or screenshot, not a camera photo
+    return True
+
+
+def _print_score(a):
+    s = 0.0
+    ex = a.get("exifInfo") or {}
+    if a.get("isFavorite"):
+        s += 4
+    if (ex.get("rating") or 0) >= 4:
+        s += 2
+    named = [p for p in a.get("people") or [] if (p.get("name") or "").strip()]
+    if named:
+        s += 2 + 0.5 * min(len(named), 3)
+    elif a.get("people"):
+        s += 1
+    if ex.get("make") or ex.get("model"):
+        s += 0.5
+    w, h = ex.get("exifImageWidth") or 0, ex.get("exifImageHeight") or 0
+    if w and h and min(w, h) < 1000:
+        s -= 2  # too small for a good print
+    return s
+
+
+def _taken(a):
+    return a.get("localDateTime") or a.get("fileCreatedAt") or ""
+
+
+def _print_rank(items):
+    """Best photos first, spread over the month: each round takes the best photo of every day not used yet, and a
+    photo taken within two minutes of one already picked (a burst) waits until the end."""
+    days = {}
+    for a in items:
+        days.setdefault(_taken(a)[:10], []).append(a)
+    for d in days.values():
+        d.sort(key=lambda a: (-_print_score(a), _taken(a)))
+    # Days by their best photo; days that score the same are taken far apart (not the first week of the month).
+    left, order = sorted(days), []
+    while left:
+        top = max(_print_score(days[k][0]) for k in left)
+        tied = [k for k in left if _print_score(days[k][0]) >= top - 1e-9]
+        near = lambda k: min((abs(_epoch(k + "T00:00:00") - _epoch(o + "T00:00:00")) for o in order), default=0)
+        pick = max(tied, key=lambda k: (near(k), -tied.index(k)))
+        order.append(pick)
+        left.remove(pick)
+    ranked, later, times = [], [], []
+    for r in range(max((len(v) for v in days.values()), default=0)):
+        for k in order:
+            if r < len(days[k]):
+                a = days[k][r]
+                t = _epoch(_taken(a))
+                if t and any(abs(t - x) < 120 for x in times):
+                    later.append(a)
+                    continue
+                ranked.append(a)
+                times.append(t)
+    return ranked + later
+
+
+def _print_month_assets(month):
+    after, before = _month_range(month)
+    out, page = [], 1
+    while page and page <= PRINT_SCAN_PAGES:
+        body = _api("POST", "/search/metadata", {"takenAfter": after, "takenBefore": before, "type": "IMAGE",
+                                                  "withPeople": True, "withExif": True, "size": 500, "page": page,
+                                                  "order": "asc"})
+        assets = (body.get("assets") or {}) if isinstance(body, dict) else {}
+        out += [a for a in assets.get("items") or [] if isinstance(a, dict) and a.get("id")]
+        nxt = assets.get("nextPage")
+        page = int(nxt) if nxt and str(nxt).isdigit() else 0
+    return out
+
+
+def _print_row(a, own, selected):
+    row = {"id": a["id"], "file": a.get("originalFileName"), "taken": _taken(a),
+           "people": [p.get("name") for p in (a.get("people") or []) if (p.get("name") or "").strip()],
+           "favorite": bool(a.get("isFavorite")), "selected": a["id"] in selected}
+    if own:
+        row["open"] = "%s/photos/%s" % (own, a["id"])
+    return row
+
+
+def _library_empty():
+    st = _api("GET", "/assets/statistics")
+    return isinstance(st, dict) and not (st.get("total") or st.get("images") or st.get("videos"))
+
+
+def print_review(month=""):
+    month = month or _prev_month()
+    _month_range(month)
+    saved_all = _print_saved()
+    saved = saved_all.get(month) if isinstance(saved_all.get(month), dict) else None
+    doc = {"month": month, "label": _month_label(month), "previous_month": _prev_month(),
+           "shortlist_size": PRINT_SHORTLIST, "max": PRINT_MAX, "note_max": PRINT_NOTE_MAX,
+           "never_orders": NEVER_ORDERS, "library_empty": False, "candidates": [],
+           "saved": ({"count": len(saved.get("assets") or []), "note": saved.get("note") or "",
+                      "saved_at": saved.get("saved_at")} if saved else None),
+           "saved_months": [{"month": k, "label": _month_label(k), "count": len(v.get("assets") or []),
+                             "note": v.get("note") or "", "saved_at": v.get("saved_at")}
+                            for k, v in sorted(saved_all.items(), reverse=True) if MONTH_RE.match(k) and isinstance(v, dict)]}
+    if _library_empty():
+        doc.update(library_empty=True, next=PRINT_EMPTY)
+        return doc
+    items = [a for a in _print_month_assets(month) if _printable(a)]
+    ranked = _print_rank(items)
+    pool = ranked[:PRINT_POOL]
+    chosen = list((saved or {}).get("assets") or []) or [a["id"] for a in ranked[:PRINT_SHORTLIST]]
+    by_id = {a["id"]: a for a in items}
+    pool += [by_id[i] for i in chosen if i in by_id and by_id[i] not in pool]
+    pool.sort(key=_taken)
+    own = _own_url()
+    doc["candidates"] = [_print_row(a, own, set(chosen)) for a in pool]
+    doc["photos_in_month"] = len(items)
+    if not items:
+        doc["next"] = "No photos taken in %s. Pick another month." % doc["label"]
+    elif saved:
+        doc["next"] = "This is the set you approved. Change it and save again, or leave it."
+    else:
+        doc["next"] = ("Photos picked %d of %d photos from %s. Tap a photo to take it out or put it in, add a note, "
+                       "then save the approved set." % (min(PRINT_SHORTLIST, len(ranked)), len(items), doc["label"]))
+    return doc
+
+
+def print_review_save(month, asset_ids, note=""):
+    month = str(month or "")
+    _month_range(month)
+    if not isinstance(asset_ids, list) or not all(isinstance(x, str) and UUID_RE.match(x) for x in asset_ids):
+        raise ValueError("assets is a list of Immich photo ids")
+    ids = list(dict.fromkeys(asset_ids))
+    if not ids:
+        raise ValueError("Pick at least one photo for the set.")
+    if len(ids) > PRINT_MAX:
+        raise ValueError("At most %d photos in one month's set." % PRINT_MAX)
+    note = re.sub(r"\s+", " ", str(note or "")).strip()
+    if len(note) > PRINT_NOTE_MAX:
+        raise ValueError("Keep the note to %d characters." % PRINT_NOTE_MAX)
+    in_month = {a["id"] for a in _print_month_assets(month) if _printable(a)}
+    stray = [x for x in ids if x not in in_month]
+    if stray:
+        raise ValueError("%d of these photos are not from %s (or no longer in the library). Reload and pick again."
+                         % (len(stray), _month_label(month)))
+    with PRINT_LOCK:
+        months = _print_saved()
+        months[month] = {"assets": ids, "note": note, "saved_at": int(time.time())}
+        _write_json("print-review.json", {"months": months})
+    return print_review(month)
+
+
+def print_thumb(asset_id):
+    if not UUID_RE.match(str(asset_id or "")):
+        raise ValueError("not an Immich photo id")
+    key = _key()
+    if not key:
+        raise RuntimeError("Photos is still setting itself up.")
+    code, data = _immich("GET", "/assets/%s/thumbnail?size=thumbnail" % asset_id, key=key, raw=True, timeout=30)
+    if code != 200 or not data:
+        raise RuntimeError("No picture for that photo yet.")
+    ctype = "image/webp" if data[:4] == b"RIFF" and data[8:12] == b"WEBP" else "image/jpeg"
+    return 200, ctype, data, {"Cache-Control": "private, max-age=86400"}
+
+
+@tool("photos_print_review", "Monthly print review (read only): the photos the owner approved to print for a month, his "
+      "note, and Photos' suggested shortlist when nothing is saved yet. Default month: last month. This never orders, "
+      "mails or pays for prints, and no tool does: printing is a separate step the owner takes himself.",
+      {"month": {"type": "string", "description": "YYYY-MM; default last month"}}, switch=PRINT_SWITCH)
+def photos_print_review(month=""):
+    _box_only()
+    d = print_review(month)
+    picked = [c for c in d["candidates"] if c["selected"]]
+    return {"month": d["month"], "label": d["label"], "approved_by_owner": bool(d["saved"]),
+            "note": (d["saved"] or {}).get("note", ""), "photos": picked, "library_empty": d["library_empty"],
+            "next": d.get("next", ""), "saved_months": d["saved_months"], "never_orders": NEVER_ORDERS}
+# ---- end monthly print review ----
+
+
 # ---- wizard.app-switches/1 (wizard-os docs/APP_SWITCHES.md) ----
 # Owner feature switches. New features ship behind one, off by default: append it to SWITCHES
 # ({"id", "name", "description", "default": False, "issues": ["humanitylabs-org/photos#N"]}) and gate it on
 # switch_on(id). Kept on the box (STATE_DIR/switches.json). Owner only: the box's Tailscale Serve login with
 # X-Wizard-Switch: 1; never a bearer or a box-local host.
-SWITCHES = []
+SWITCHES = [
+    {"id": PRINT_SWITCH, "name": "Monthly print review",
+     "description": "Once a month Photos suggests a few photos from last month to print (for the grandparents, say). "
+                    "You take photos out or put others in, add a short note and save the approved set. Photos never "
+                    "orders, mails or pays for prints.",
+     "default": False, "issues": ["humanitylabs-org/photos#2"]},
+]
 _SW_LOCAL = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
 
 
@@ -1478,6 +1720,17 @@ def page_route(method, path, query, headers, body):
             if method == "POST" and sub == "api/import/start":
                 _body(headers, body)
                 return _json(200, import_start(True))
+            if sub.startswith("api/print-review") and switch_on(PRINT_SWITCH):
+                q = dict(urllib.parse.parse_qsl(query))
+                if method == "GET" and sub == "api/print-review":
+                    return _json(200, print_review(q.get("month", "")))
+                if method == "GET" and sub == "api/print-review/thumb":
+                    return print_thumb(q.get("id", ""))
+                if method == "POST" and sub == "api/print-review":
+                    d = _body(headers, body)
+                    if set(d) - {"month", "assets", "note"}:
+                        raise ValueError("send month, assets and note")
+                    return _json(200, print_review_save(d.get("month"), d.get("assets"), d.get("note", "")))
         except (ValueError, RuntimeError) as e:
             return _json(400, {"error": str(e)})
         return _json(404, {"error": "not found"})

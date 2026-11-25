@@ -20,7 +20,7 @@ class ReviewAlbumsRemoved(unittest.TestCase):
         self.assertIn("photos_move_to_trash", names)
         r = m.rpc({"method": "tools/call", "id": 2, "params": {"name": "photos_trash_album", "arguments": {}}})
         self.assertIn("error", r)
-        self.assertEqual([x["id"] for x in m.switches_doc()["switches"]], [])
+        self.assertNotIn("review-albums", [x["id"] for x in m.switches_doc()["switches"]])
         self.assertFalse(hasattr(m, "review_album") or hasattr(m, "trash_album"))
 
     def test_album_delete_scopes_dropped(self):

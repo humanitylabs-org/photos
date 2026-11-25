@@ -11,7 +11,6 @@
 - Google Takeout import uses immich-go (https://github.com/simulot/immich-go, AGPL-3.0), downloaded on the
   owner's first import and checked against its pinned release checksum.
 """
-import calendar
 import hashlib
 import hmac
 import http.client as httpclient  # bound as httpclient only: the front's own http() helper keeps its name
@@ -38,18 +37,6 @@ KEY_PERMISSIONS = [
     "server.storage", "stack.create", "tag.asset", "tag.create", "tag.read", "user.read", "job.create", "job.read",
     "person.read", "person.statistics", "timeline.read",
 ]
-# Only while the capture inbox is on (wizard-os issue 696): its undo takes a photo out of an album it added it to and
-# takes away an album or a tag it made. With the box switch off the key has exactly KEY_PERMISSIONS.
-CAPTURE_PERMISSIONS = ["albumAsset.delete", "album.delete", "tag.delete"]
-
-
-def _key_permissions():
-    on = globals().get("_capture_on")
-    try:
-        extra = CAPTURE_PERMISSIONS if on and on() else []
-    except Exception:  # noqa: BLE001
-        extra = []
-    return KEY_PERMISSIONS + extra
 IMMICH_GO = {
     "version": "v0.32.0",
     "amd64": ("https://github.com/simulot/immich-go/releases/download/v0.32.0/immich-go_Linux_x86_64.tar.gz",
@@ -608,19 +595,18 @@ def _ensure_agent_key(force=False):
         if old.get("secret") and not force:
             c, _ = _immich("GET", "/users/me", key=old["secret"], timeout=10)
             # A key whose stored scopes differ from KEY_PERMISSIONS (a scope added or dropped) is remade once.
-            upgrade = c == 200 and tok and sorted(old.get("permissions") or []) != sorted(_key_permissions())
+            upgrade = c == 200 and tok and sorted(old.get("permissions") or []) != sorted(KEY_PERMISSIONS)
             if c != 401 and not upgrade:
                 return c == 200
         if not tok:
             return False
         if old.get("id"):
             _immich("DELETE", "/api-keys/%s" % old["id"], token=tok)
-        perms = _key_permissions()
-        c, made = _immich("POST", "/api-keys", {"name": KEY_NAME, "permissions": perms}, token=tok)
+        c, made = _immich("POST", "/api-keys", {"name": KEY_NAME, "permissions": KEY_PERMISSIONS}, token=tok)
         if c not in (200, 201) or not made.get("secret"):
             return False
         _write_json("agent-key.json", {"id": (made.get("apiKey") or {}).get("id"), "secret": made["secret"],
-                                        "user": _owner().get("email"), "permissions": list(perms),
+                                        "user": _owner().get("email"), "permissions": list(KEY_PERMISSIONS),
                                         "created_at": int(time.time())})
         return True
 
@@ -990,363 +976,6 @@ def _body(headers, body):
     return d
 
 
-# ---- capture inbox (wizard-os issue 696, spec/CAPTURE_INBOXES.md; the box switch wizard/capture-inbox) ----
-# New photos from the camera-roll backup are an inbox: after a quiet period Photos hands a batch (its own id and count,
-# no content) to the owner's main agent through the Agent Service, with Photos's own app token. The agent reads the
-# batch with photos_capture_batch and handles each photo by the owner's rules with photos_capture_file (tags, an album,
-# the processed mark; all logged here) and the Service's wizard_capture (copies in Files, notes). Photos never moves or
-# deletes an original. "Undo that" on the Service marks the batch undone; Photos reads that from the probe and takes
-# away its own tags, album additions and processed marks.
-# Off (the Service answers 404, an older Service, or no token): Photos does nothing new, and these tools are not listed.
-CAPTURE_SERVICE = (os.environ.get("PHOTOS_AGENT_SERVICE") or "http://wizard-agent-service:8787").rstrip("/")
-CAPTURE_PATH = "/wizard/v1/capture/events"
-CAPTURE_POLL_S = max(5, int(os.environ.get("PHOTOS_CAPTURE_POLL_S") or 30))
-CAPTURE_QUIET_S = max(1, int(os.environ.get("PHOTOS_CAPTURE_QUIET_S") or 120))
-CAPTURE_RECENT_S = 3 * 86400   # only photos taken at most 3 days before they arrived: a phone's first backup of years
-                               # of camera roll, or a Takeout import, is the owner's library, not new captures
-CAPTURE_BATCH_MAX = 50
-CAPTURE_GATE = "box:capture-inbox"
-CAPTURE_SETTLE_S = 2.0
-PROCESSED_TAG = "Wizard/Processed"
-CAPTURE_LOCK = threading.Lock()
-BATCH_RE = re.compile(r"^pb_[0-9a-f]{12}\Z")
-
-
-def _capture_token():
-    return (os.environ.get("PHOTOS_AGENT_INBOX_TOKEN") or "").strip()
-
-
-def _capture_state():
-    st = _read_json("capture.json", None)
-    if not isinstance(st, dict):
-        st = {}
-    st.setdefault("active", False)
-    st.setdefault("cursor", "")
-    st.setdefault("edge", [])
-    st.setdefault("pending", {})
-    st.setdefault("last_new", 0)
-    st.setdefault("batches", {})
-    return st
-
-
-def _capture_service(method, payload=None):
-    """Call the Agent Service's capture route with Photos's own app token. Returns (status, JSON or {})."""
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(CAPTURE_SERVICE + CAPTURE_PATH, data=data, method=method, headers=dict(
-        {"Authorization": "Bearer " + _capture_token(), "Accept": "application/json"},
-        **({"Content-Type": "application/json"} if data is not None else {})))
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            code, body = r.status, r.read()
-    except urllib.error.HTTPError as e:
-        code, body = e.code, e.read()
-    except OSError:
-        return 0, {}
-    try:
-        return code, json.loads(body or b"{}")
-    except ValueError:
-        return code, {}
-
-
-def _iso_now(offset=0):
-    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + offset))
-
-
-def _epoch(iso):
-    try:
-        return calendar.timegm(time.strptime(str(iso)[:19], "%Y-%m-%dT%H:%M:%S"))
-    except (ValueError, TypeError):
-        return 0
-
-
-def _import_running():
-    p = RUN.get("proc")
-    return p is not None and p.poll() is None
-
-
-def _capture_collect(st):
-    """New assets since the cursor go to pending (uploaded after the switch went on, taken recently, not an import)."""
-    known = set(st["pending"]) | {a for b in st["batches"].values() for a in b.get("assets", [])}
-    edge = set(st.get("edge") or [])
-    newest, newest_ids = st["cursor"], set(edge)
-    page, added = 1, 0
-    while page and page <= 20:
-        body = _api("POST", "/search/metadata", {"createdAfter": st["cursor"], "withDeleted": False,
-                                                  "visibility": "timeline", "size": 250, "page": page})
-        assets = (body.get("assets") or {}) if isinstance(body, dict) else {}
-        for a in assets.get("items") or []:
-            aid, created = a.get("id"), a.get("createdAt") or ""
-            if not aid or aid in known or aid in edge:
-                continue
-            if created > newest:
-                newest, newest_ids = created, {aid}
-            elif created == newest:
-                newest_ids.add(aid)
-            taken = a.get("fileCreatedAt") or created
-            if a.get("isTrashed") or _import_running() or _epoch(created) - _epoch(taken) > CAPTURE_RECENT_S:
-                continue
-            st["pending"][aid] = {"created": created, "seen": time.time()}
-            known.add(aid)
-            added += 1
-        nxt = assets.get("nextPage")
-        page = int(nxt) if nxt and str(nxt).isdigit() else 0
-    st["cursor"], st["edge"] = newest, sorted(newest_ids)[:500]
-    if added:
-        st["last_new"] = time.time()
-    return added
-
-
-def _capture_send(st):
-    """Hand every unsent batch to the Service; make a new batch once the quiet period is over."""
-    if st["pending"] and time.time() - st["last_new"] >= CAPTURE_QUIET_S:
-        ids = sorted(st["pending"], key=lambda k: (st["pending"][k]["created"], k))[:CAPTURE_BATCH_MAX]
-        bid = "pb_" + secrets.token_hex(6)
-        st["batches"][bid] = {"assets": ids, "at": _iso_now(), "sent": False, "log": [], "reverted": False}
-        for k in ids:
-            st["pending"].pop(k, None)
-    for bid, b in sorted(st["batches"].items(), key=lambda kv: kv[1].get("at", "")):
-        if b.get("sent"):
-            continue
-        code, ans = _capture_service("POST", {"event": "items_arrived", "data": {
-            "source": "photos", "batch": bid, "count": len(b["assets"]), "at": b["at"]}})
-        if code in (200, 202) and ans.get("accepted"):
-            b["sent"], b["service_batch"] = True, ans.get("batch") or ""
-        else:
-            break   # the Service is busy, restarting or switched off: the same batch goes again next time
-
-
-def _capture_revert(st, batches):
-    """Batches the owner undid on the Service: take away exactly what this app added (tags, albums, processed)."""
-    undone = {b.get("app_batch") for b in batches or [] if isinstance(b, dict) and b.get("undone_at")}
-    for bid in sorted(undone & set(st["batches"])):
-        b = st["batches"][bid]
-        if b.get("reverted"):
-            continue
-        problems = []
-        for e in reversed(b.get("log") or []):
-            if e.get("reverted"):
-                continue
-            try:
-                gone = [t["id"] for t in e.get("tags_added") or []]
-                for t in gone:
-                    _api("DELETE", "/tags/%s/assets" % t, {"ids": [e["asset"]]})
-                if gone and not _settle_tags(e["asset"], absent=gone, wait=CAPTURE_SETTLE_S):
-                    raise RuntimeError("tags came back")
-                al = e.get("album") or {}
-                if al.get("added"):
-                    _api("DELETE", "/albums/%s/assets" % al["id"], {"ids": [e["asset"]]})
-                if al.get("created"):
-                    left = _api("GET", "/albums/%s" % al["id"])
-                    if isinstance(left, dict) and not left.get("assetCount"):
-                        _api("DELETE", "/albums/%s" % al["id"])
-                for t in e.get("tags_made") or []:
-                    # A tag this batch made is taken away again once no photo has it (deepest first).
-                    used = _api("POST", "/search/metadata", {"tagIds": [t["id"]], "size": 1, "withDeleted": True})
-                    if not ((used.get("assets") or {}).get("items") if isinstance(used, dict) else None):
-                        _api("DELETE", "/tags/%s" % t["id"])
-                e["reverted"] = True
-            except Exception as ex:  # noqa: BLE001 - kept for the next look, never lost
-                problems.append("%s: %s" % (e.get("asset"), ex))
-        b["reverted"] = not problems
-        b["revert_problems"] = problems[:10]
-
-
-def capture_tick():
-    """One look: the switch (the Service's probe), undone batches, new photos, batches due."""
-    if not _capture_token() or not _key():
-        return
-    with CAPTURE_LOCK:
-        st = _capture_state()
-        code, probe = _capture_service("GET")
-        if code == 404 or (code == 200 and probe.get("on") is not True):
-            if st["active"]:
-                st.update(active=False, pending={}, cursor="", edge=[])
-                _write_json("capture.json", st)
-                _ensure_agent_key()   # back to the plain scopes
-            return
-        if code != 200:
-            return
-        if not st["active"]:
-            # Switched on now: what is already in the library is the owner's own, never handed over.
-            st.update(active=True, cursor=_iso_now(), edge=[], pending={}, last_new=0)
-            _write_json("capture.json", st)
-            _ensure_agent_key()   # adds the undo scopes (album out, album made) while the inbox is on
-            return
-        _capture_revert(st, probe.get("batches"))
-        _capture_collect(st)
-        _capture_send(st)
-        if len(st["batches"]) > 200:
-            for old in sorted(st["batches"], key=lambda k: st["batches"][k].get("at", ""))[:-200]:
-                st["batches"].pop(old)
-        _write_json("capture.json", st)
-
-
-def _capture_loop():
-    while True:
-        try:
-            capture_tick()
-        except Exception:  # noqa: BLE001 - Immich restarting or the Service away: look again next time
-            pass
-        time.sleep(CAPTURE_POLL_S)
-
-
-STARTUP.append(lambda: threading.Thread(target=_capture_loop, daemon=True).start())
-
-
-def _capture_on():
-    return bool(_capture_token()) and _capture_state().get("active") is True
-
-
-def _capture_batch(batch):
-    st = _capture_state()
-    b = st["batches"].get(str(batch or "")) if BATCH_RE.match(str(batch or "")) else None
-    if not b:
-        raise ValueError("No Photos capture batch %r. Recent: %s" % (batch, ", ".join(sorted(st["batches"])[-5:]) or "none"))
-    return st, b
-
-
-def _files_path(original):
-    p = str(original or "")
-    if not p.startswith("/data/"):
-        return ""
-    rel = p[len("/data/"):]
-    if ".." in rel.split("/"):
-        return ""
-    return "Photos/Library/" + rel
-
-
-def capture_batch(batch=""):
-    if not batch:
-        st = _capture_state()
-        recent = sorted(st["batches"].items(), key=lambda kv: kv[1].get("at", ""))[-10:]
-        return {"active": st["active"], "pending": len(st["pending"]), "batches": [
-            {"batch": k, "at": b.get("at"), "count": len(b.get("assets", [])), "sent": b.get("sent"),
-             "undone": b.get("reverted")} for k, b in reversed(recent)]}
-    st, b = _capture_batch(batch)
-    own, items = _own_url(), []
-    done = {e["asset"]: e for e in b.get("log") or [] if not e.get("reverted")}
-    for aid in b["assets"]:
-        try:
-            a = _api("GET", "/assets/%s" % aid)
-        except RuntimeError as ex:
-            items.append({"asset_id": aid, "problem": str(ex)})
-            continue
-        row = {"asset_id": aid, "file_name": a.get("originalFileName"), "type": a.get("type"),
-               "taken": a.get("fileCreatedAt"), "arrived": a.get("createdAt"),
-               "files_path": _files_path(a.get("originalPath")), "trashed": bool(a.get("isTrashed")),
-               "state": "processed" if aid in done else "waiting"}
-        if own:
-            row["open"] = own + "/photos/" + aid
-        if aid in done:
-            e = done[aid]
-            row["done"] = {"judged_as": e.get("judged_as"), "tags": [t["name"] for t in e.get("tags_added") or []],
-                           "album": (e.get("album") or {}).get("name")}
-        items.append(row)
-    return {"batch": batch, "service_batch": b.get("service_batch", ""), "items": items,
-            "how": "Look at each original (files_path is inside the owner's Files) and handle it by the capture rules: "
-                   "photos_capture_file for every photo (tags, album; marks it processed); for document photos also "
-                   "wizard_capture action copy (from = files_path) and note. Originals never move."}
-
-
-def _tag_values():
-    out = _api("GET", "/tags")
-    return {t.get("value"): t.get("id") for t in out if isinstance(t, dict)} if isinstance(out, list) else {}
-
-
-def _asset_tags(asset_id):
-    a = _api("GET", "/assets/%s" % asset_id)
-    return {t.get("id") for t in (a.get("tags") or []) if isinstance(t, dict)}
-
-
-def _settle_tags(asset_id, present=(), absent=(), rounds=6, wait=2.0):
-    """Immich writes tags to the photo's sidecar and reads the sidecar back a moment later, which can undo a tag change
-    made in between. Look again until the tags hold: re-add what is missing, take away what came back."""
-    present, absent = set(present), set(absent)
-    clean = 0
-    for _ in range(rounds):
-        time.sleep(wait)
-        have = _asset_tags(asset_id)
-        missing, extra = present - have, absent & have
-        if missing:
-            _api("PUT", "/tags/assets", {"assetIds": [asset_id], "tagIds": sorted(missing)})
-        for t in extra:
-            _api("DELETE", "/tags/%s/assets" % t, {"ids": [asset_id]})
-        clean = clean + 1 if not (missing or extra) else 0
-        if clean >= 2:
-            return True
-    return False
-
-
-def capture_file(batch, asset_id, judged_as="", rule="", tags=None, album=""):
-    with CAPTURE_LOCK:
-        st, b = _capture_batch(batch)
-        if asset_id not in b["assets"]:
-            raise ValueError("Batch %s has no photo %r. Photos: %s" % (batch, asset_id, ", ".join(b["assets"])))
-        if b.get("reverted"):
-            raise ValueError("That batch was undone; nothing more is done with it.")
-        names = []
-        for t in (tags or [])[:10]:
-            t = re.sub(r"\s+", " ", str(t)).strip().strip("/")
-            if t and len(t) <= 80 and t not in names and t != PROCESSED_TAG:
-                names.append(t)
-        names.append(PROCESSED_TAG)
-        before_tags = _tag_values()
-        _api("PUT", "/tags", {"tags": names})
-        after_tags = _tag_values()
-        made_tags = sorted((v for v in after_tags if v not in before_tags), key=lambda v: -v.count("/"))
-        had = _asset_tags(asset_id)
-        want = {after_tags[n] for n in names if after_tags.get(n)}
-        new = sorted(want - had)
-        if new:
-            # One change for all tags, so Immich's sidecar holds them all at once.
-            _api("PUT", "/tags/assets", {"assetIds": [asset_id], "tagIds": new})
-        added = [{"id": t, "name": next(n for n in names if after_tags.get(n) == t)} for t in new]
-        al = {}
-        album = re.sub(r"\s+", " ", str(album or "")).strip()[:120]
-        if album:
-            existing = next((x for x in _api("GET", "/albums") or [] if x.get("albumName") == album), None)
-            if existing:
-                res = _api("PUT", "/albums/%s/assets" % existing["id"], {"ids": [asset_id]})
-                ok = any(r.get("id") == asset_id and r.get("success") for r in res if isinstance(r, dict))
-                al = {"id": existing["id"], "name": album, "created": False, "added": ok}
-            else:
-                made = _api("POST", "/albums", {"albumName": album, "assetIds": [asset_id]})
-                al = {"id": made.get("id"), "name": album, "created": True, "added": True}
-        b["log"].append({"asset": asset_id, "judged_as": str(judged_as)[:80], "rule": str(rule)[:200],
-                         "tags_added": added, "tags_made": [{"id": after_tags[v], "value": v} for v in made_tags],
-                         "album": al, "at": _iso_now()})
-        _write_json("capture.json", st)
-    if new:
-        _settle_tags(asset_id, present=new, wait=CAPTURE_SETTLE_S)
-    return {"asset_id": asset_id, "processed": True, "tags_added": [t["name"] for t in added],
-            "album": al.get("name") or "", "album_created": bool(al.get("created"))}
-
-@tool("photos_capture_batch", "Capture inbox: the new photos of one Photos batch (the batch id from the capture "
-      "message): each photo's asset_id, file name, when it was taken, files_path (its original inside the owner's "
-      "Files, to look at with vision or copy with wizard_capture action copy) and whether it was handled. Without "
-      "batch: the recent batches.", {"batch": {"type": "string", "description": "pb_... from the capture message"}},
-      switch=CAPTURE_GATE)
-def photos_capture_batch(batch=""):
-    _box_only()
-    return capture_batch(batch)
-
-
-@tool("photos_capture_file", "Capture inbox: handle one photo of a batch by the owner's capture rules. It stays in "
-      "Photos: adds the tags you give (people, places, events; e.g. 'Tokyo 2026'), adds it to an album (made when "
-      "missing), and marks it processed (tag Wizard/Processed). Every step is logged so the owner's 'undo that' takes it "
-      "away again. Call it once for every photo of the batch, document photos too (after copying them to Files).",
-      {"batch": {"type": "string"}, "asset_id": {"type": "string"},
-       "judged_as": {"type": "string", "description": "What you judged it to be: personal photo, book page, receipt ..."},
-       "rule": {"type": "string", "description": "The rule you applied, in the owner's words, or 'best guess'"},
-       "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
-       "album": {"type": "string", "description": "Album name for the event or trip, if the rules call for one"}},
-      required=("batch", "asset_id"), switch=CAPTURE_GATE)
-def photos_capture_file(batch, asset_id, judged_as="", rule="", tags=None, album=""):
-    _box_only()
-    return capture_file(batch, asset_id, judged_as, rule, tags, album)
-# ---- end capture inbox ----
-
-
 # ---- wizard.app-switches/1 (wizard-os docs/APP_SWITCHES.md) ----
 # Owner feature switches. New features ship behind one, off by default: append it to SWITCHES
 # ({"id", "name", "description", "default": False, "issues": ["humanitylabs-org/photos#N"]}) and gate it on
@@ -1363,8 +992,6 @@ def switches_doc():
 
 
 def switch_on(switch_id):
-    if switch_id == CAPTURE_GATE:   # the box's switch (wizard/capture-inbox), read from the Agent Service's probe
-        return _capture_on()
     return next((x["on"] for x in switches_doc()["switches"] if x["id"] == switch_id), False)
 
 
@@ -1412,10 +1039,13 @@ def switches_route(method, headers, body):
 def _drop_removed_switch_state():
     # Review albums (switch review-albums, humanitylabs-org/photos#6) were dropped (#14): forget their stored values.
     # Albums already made in Immich are the owner's photos and stay as they are.
-    try:
-        os.remove(_state_path("review-albums.json"))
-    except OSError:
-        pass
+    # The capture inbox (a box switch, wizard-os#696) was dropped too (wizard-os#949): forget its
+    # batch state. Tags, albums and Wizard/Processed marks already in Immich are the owner's photos and stay.
+    for name in ("review-albums.json", "capture.json"):
+        try:
+            os.remove(_state_path(name))
+        except OSError:
+            pass
     saved = _read_json("switches.json", None)
     if isinstance(saved, dict) and "review-albums" in saved:
         saved.pop("review-albums")

@@ -29,16 +29,6 @@ The app's port is served only on the owner's tailnet, so reaching it is the acce
 ## Agent tools (MCP, box-only)
 `photos_status`, `photos_people`, `photos_search`, `photos_move_to_trash` (preview, then confirmed with the exact count; Immich trash only, never `force`), `photos_restore_from_trash`, `photos_import_status`, `photos_import_start`. See [SKILL.md](SKILL.md).
 
-## Capture inbox (box switch `wizard/capture-inbox`, off by default)
-wizard-os#696, spec `spec/CAPTURE_INBOXES.md`. With the switch on, the Agent Service answers Photos's probe
-(`GET /wizard/v1/capture/events`, Photos's own app token `PHOTOS_AGENT_INBOX_TOKEN` from the App Manager) and Photos
-watches for new uploads: photos taken at most 3 days before they arrived (not a Takeout import, not a phone's first
-backup of old photos), batched after 2 quiet minutes and handed over with `items_arrived` (ids only, no content). The
-agent then gets `photos_capture_batch` and `photos_capture_file` (tags, an album, the `Wizard/Processed` tag; logged),
-and copies document photos into Files with the Service's `wizard_capture`. Originals never move. When the owner undoes a
-batch on the Service, Photos takes away exactly the tags, album additions and albums it made. While on, the agent key
-also has `albumAsset.delete` and `album.delete` for that undo. Switch off (or no token): nothing changes.
-
 ## Develop
 Edit `mcp/front.py`, `mcp/tools.py` or `web/`, then `python3 mcp/inline.py` (regenerates the compose `command` and `app/front.py`), `python3 -m unittest discover -s tests`, `wam verify .`.
 

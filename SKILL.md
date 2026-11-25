@@ -21,12 +21,6 @@ The owner's own Google Photos replacement: unmodified Immich on his box, opened 
 - `photos_restore_from_trash`: undo, by ids or `everything=true`.
 - `photos_import_status` / `photos_import_start`: Google Takeout import (below). `photos_import_start` without `confirmed` only lists the files.
 
-## Capture inbox (only while the box switch wizard/capture-inbox is on)
-New camera-roll photos (taken at most 3 days before they arrived, never a Takeout import or a phone's first backup of old photos) are handed to you in batches, after 2 quiet minutes, as a background capture message with a Photos batch id (`pb_...`) and a capture batch (`cap_...`). Then:
-- `photos_capture_batch` (batch): every photo's `asset_id`, file name, taken time and `files_path` (its original inside the owner's Files; look at it with vision, copy it with `wizard_capture` action copy).
-- `photos_capture_file` (batch, asset_id, judged_as, rule, tags, album): call it once for every photo. Personal photos stay in Photos with tags (people, places, events) and an album for the event or trip. Document photos (book pages, receipts, whiteboards): first `wizard_capture` action copy into the folder the owner's rules name and action note for text you take out (book-page highlights into `Reading/<book title>.md`), then `photos_capture_file`. It also marks the photo processed (tag `Wizard/Processed`).
-- Originals never move and are never deleted. "Undo that" (`wizard_capture` action undo, or the owner's undo) takes copies and notes away, and Photos takes away its own tags, album additions and processed marks within a minute.
-
 Permanent deletion is the owner's own act in Immich: Trash › Empty trash (or wait 30 days). Never claim a photo is gone for good after `photos_move_to_trash`.
 
 ## Monthly print review (only while the app switch print-review is on)

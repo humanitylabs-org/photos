@@ -29,6 +29,16 @@ The app's port is served only on the owner's tailnet, so reaching it is the acce
 ## Agent tools (MCP, box-only)
 `photos_status`, `photos_people`, `photos_search`, `photos_move_to_trash` (preview, then confirmed with the exact count; Immich trash only, never `force`), `photos_restore_from_trash`, `photos_import_status`, `photos_import_start`. See [SKILL.md](SKILL.md).
 
+## Monthly print review (app switch `print-review`, off by default)
+humanitylabs-org/photos#2. With the switch on, Photos has a **Print review** entry (header chip, or the ⋯ menu on a
+phone). It opens last month (‹ › for other months): Photos suggests 8 photos out of up to 24 candidates from that month
+(images only, no screenshots or saved PNGs; favourites, 4-5 star ratings and photos with named people first; spread over
+different days and never two from the same two-minute burst). The owner taps photos out or in (up to 30), writes a
+short note (280 characters) and saves the approved set; it is kept per month on the box (`/state/print-review.json`).
+An empty library shows how to fill it (phone backup or Import from Google). The agent can read a month's set with
+`photos_print_review`. Nothing in Photos orders, mails or pays for prints: that stays a separate step the owner takes.
+Switch off: no entry, the routes answer 404, no tool, and a saved file is left as it is.
+
 ## Develop
 Edit `mcp/front.py`, `mcp/tools.py` or `web/`, then `python3 mcp/inline.py` (regenerates the compose `command` and `app/front.py`), `python3 -m unittest discover -s tests`, `wam verify .`.
 
